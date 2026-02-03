@@ -8,3 +8,13 @@ wheels/
 
 # Virtual environments
 .venv
+
+# macOS
+.DS_Store
+
+# Transcripts (example outputs)
+*.md
+!README.md
+
+# Swift build artifacts (users run `make build`)
+audiocapture/.build/

@@ -1,8 +1,13 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
-name = "parakeet"
+name = "livekeet"
 version = "0.1.0"
-description = "Real-time audio transcription to markdown using NVIDIA Parakeet via MLX"
+description = "Real-time audio transcription to markdown using NVIDIA Parakeet via MLX. Optimized for Apple Silicon."
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
     "numpy<2.4",
@@ -10,9 +15,10 @@ dependencies = [
     "setuptools",
     "sounddevice>=0.5.5",
     "webrtcvad>=2.0.10",
-    "pyannote.audio>=3.1",
-    "huggingface-hub",
 ]
 
 [project.scripts]
-transcribe = "stream_transcribe:main"
+livekeet = "livekeet:main"
+
+[tool.uv]
+package = true
