@@ -23,7 +23,7 @@ Uses NVIDIA's Parakeet speech recognition model via MLX for fast, accurate, on-d
 
 ```bash
 # Clone the repo
-git clone https://github.com/yourusername/livekeet.git
+git clone https://github.com/LucaDeLeo/livekeet.git
 cd livekeet
 
 # Install Python dependencies
@@ -51,6 +51,9 @@ livekeet meeting.md
 
 # Name the other speaker (for 1:1 calls)
 livekeet --with "John"
+
+# Multilingual transcription
+livekeet --multilingual
 
 # Mic only (no system audio)
 livekeet --mic-only
@@ -84,10 +87,10 @@ filename = "{datetime}.md"
 name = "Me"
 
 [defaults]
-# Model options:
-# - mlx-community/parakeet-tdt-0.6b-v2 (fast, English)
-# - mlx-community/parakeet-tdt-0.6b-v3
-# - mlx-community/parakeet-tdt-1.1b (more accurate)
+# Available models (downloaded automatically on first use):
+#   mlx-community/parakeet-tdt-0.6b-v2  - Fast, English only (default)
+#   mlx-community/parakeet-tdt-0.6b-v3  - Fast, multilingual
+#   mlx-community/parakeet-tdt-1.1b     - Slower, English, highest accuracy
 model = "mlx-community/parakeet-tdt-0.6b-v2"
 ```
 
@@ -156,9 +159,9 @@ When using system audio capture (the default), livekeet automatically detects wh
 
 | Model | Size | Speed | Notes |
 |-------|------|-------|-------|
-| parakeet-tdt-0.6b-v2 | 600M | Fast | English only, default |
-| parakeet-tdt-0.6b-v3 | 600M | Fast | English only |
-| parakeet-tdt-1.1b | 1.1B | Slower | More accurate |
+| parakeet-tdt-0.6b-v2 | 600M | Fast | English only (default) |
+| parakeet-tdt-0.6b-v3 | 600M | Fast | Multilingual (`--multilingual`) |
+| parakeet-tdt-1.1b | 1.1B | Slower | English, highest accuracy |
 
 Models are downloaded automatically on first use.
 
