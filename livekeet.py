@@ -5,11 +5,13 @@ Optimized for Apple Silicon using NVIDIA Parakeet via MLX.
 """
 
 import argparse
+import re
 import stat
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import urllib.request
 import warnings
@@ -29,12 +31,13 @@ warnings.filterwarnings("ignore", category=RuntimeWarning, message="invalid valu
 import numpy as np
 import sounddevice as sd
 import webrtcvad
-from parakeet_mlx import from_pretrained
 
 # Audio settings
 SAMPLE_RATE = 16000
 VAD_FRAME_MS = 30
 SILENCE_THRESHOLD = 0.6  # seconds of silence to end utterance
+STATUS_INTERVAL = 10  # seconds between status updates
+NO_AUDIO_WARNING_SECONDS = 10
 
 # Paths
 DATA_DIR = Path.home() / ".local" / "share" / "livekeet"
@@ -177,6 +180,86 @@ def resolve_output_path(config: dict, output_arg: str | None) -> Path:
     return Path(filename)
 
 
+def ensure_unique_path(path: Path) -> tuple[Path, bool]:
+    """Ensure the output path does not overwrite an existing file."""
+    if not path.exists():
+        return path, False
+
+    suffix = path.suffix
+    stem = path.stem
+    match = re.match(r"^(.*?)-(\d+)$", stem)
+    if match:
+        base = match.group(1)
+        counter = int(match.group(2)) + 1
+    else:
+        base = stem
+        counter = 2
+
+    while True:
+        candidate = path.with_name(f"{base}-{counter}{suffix}")
+        if not candidate.exists():
+            return candidate, True
+        counter += 1
+
+
+def get_input_devices() -> list[tuple[int, dict]]:
+    """Return (index, device) pairs for input-capable devices."""
+    devices = sd.query_devices()
+    return [(i, device) for i, device in enumerate(devices) if device["max_input_channels"] > 0]
+
+
+def resolve_device(device_arg: str | int | None) -> tuple[int | str | None, str | None]:
+    """Resolve a device arg to a valid input device."""
+    if device_arg is None:
+        return None, None
+
+    devices = sd.query_devices()
+    input_devices = get_input_devices()
+    if not input_devices:
+        print("Error: No audio input devices found", file=sys.stderr)
+        sys.exit(1)
+
+    if isinstance(device_arg, str):
+        device_arg = device_arg.strip()
+        if device_arg.isdigit():
+            device_arg = int(device_arg)
+
+    if isinstance(device_arg, int):
+        if device_arg < 0 or device_arg >= len(devices) or devices[device_arg]["max_input_channels"] <= 0:
+            print(f"Error: Invalid input device index: {device_arg}", file=sys.stderr)
+            list_devices()
+            sys.exit(1)
+        return device_arg, devices[device_arg]["name"]
+
+    name = str(device_arg).lower()
+    exact_matches = [(i, d) for i, d in input_devices if d["name"].lower() == name]
+    if exact_matches:
+        idx, dev = exact_matches[0]
+        return idx, dev["name"]
+
+    partial_matches = [(i, d) for i, d in input_devices if name in d["name"].lower()]
+    if len(partial_matches) == 1:
+        idx, dev = partial_matches[0]
+        return idx, dev["name"]
+    if len(partial_matches) > 1:
+        print(f"Error: Multiple devices match '{device_arg}':", file=sys.stderr)
+        for idx, dev in partial_matches:
+            print(f"  {idx}: {dev['name']}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Error: No input device matches '{device_arg}'", file=sys.stderr)
+    list_devices()
+    sys.exit(1)
+
+
+def warn_flag_interactions(args: argparse.Namespace) -> None:
+    """Warn about ignored or overridden flags."""
+    if args.multilingual and args.model:
+        print("Warning: --multilingual overrides --model", file=sys.stderr)
+    if args.mic_only and args.other_speaker:
+        print("Warning: --with is ignored in --mic-only mode", file=sys.stderr)
+
+
 class AudioCaptureProcess:
     """Captures system audio + microphone via ScreenCaptureKit (Swift subprocess).
 
@@ -184,7 +267,7 @@ class AudioCaptureProcess:
     """
 
     # Keywords that indicate an error message worth showing
-    ERROR_KEYWORDS = ["error", "failed", "denied", "permission", "not found", "cannot", "unable"]
+    ERROR_KEYWORDS = ["error", "failed", "denied", "permission", "not found", "cannot", "unable", "warning"]
 
     def __init__(self, include_mic: bool = True):
         self.include_mic = include_mic
@@ -285,18 +368,25 @@ class Transcriber:
         other_name: str = "Other",
         device=None,
         system_audio: bool = True,
+        status_enabled: bool = False,
     ):
         self.output_file = output_file
         self.device = device
         self.speaker_name = speaker_name
         self.other_name = other_name
         self.system_audio = system_audio
+        self.status_enabled = status_enabled
         self.audio_queue: Queue = Queue()
         self.running = False
         self.audio_capture: AudioCaptureProcess | None = None
+        self.state = "listening"
+        self._started_at: float | None = None
+        self._last_audio_time: float | None = None
+        self._no_audio_warned = False
 
         short_name = model_name.split("/")[-1] if "/" in model_name else model_name
         print(f"Loading {short_name}...", end=" ", flush=True)
+        from parakeet_mlx import from_pretrained
         self.model = from_pretrained(model_name)
         print("ready")
 
@@ -304,7 +394,7 @@ class Transcriber:
         self.vad = webrtcvad.Vad(2)
         self.vad_frame_size = int(SAMPLE_RATE * VAD_FRAME_MS / 1000)
 
-    def audio_callback(self, indata, frames, time, status):
+    def audio_callback(self, indata, frames, time_info, status):
         """Called by sounddevice for each audio chunk (mic-only mode)."""
         if status:
             print(f"Audio status: {status}", file=sys.stderr)
@@ -313,6 +403,7 @@ class Transcriber:
             mono = np.mean(indata, axis=1)
         else:
             mono = indata.flatten()
+        self._last_audio_time = time.monotonic()
         # In mic-only mode: (mic_audio, None) - no system audio
         self.audio_queue.put((mono.astype(np.float32), None))
 
@@ -324,6 +415,7 @@ class Transcriber:
             result = self.audio_capture.read_chunk(chunk_samples)
             if result is not None:
                 mic_audio, system_audio = result
+                self._last_audio_time = time.monotonic()
                 while self.audio_queue.qsize() > max_queue_size:
                     try:
                         self.audio_queue.get_nowait()
@@ -331,6 +423,35 @@ class Transcriber:
                         break
                 # Queue both channels separately for per-frame energy calculation
                 self.audio_queue.put((mic_audio, system_audio))
+
+    def _status_worker(self):
+        """Periodic status updates and no-audio warnings."""
+        next_status = time.monotonic() + STATUS_INTERVAL
+        while self.running:
+            time.sleep(0.2)
+            now = time.monotonic()
+
+            if self.status_enabled and now >= next_status:
+                print(f"Status: {self.state}...", file=sys.stderr)
+                next_status = now + STATUS_INTERVAL
+
+            if (
+                not self._no_audio_warned
+                and self._started_at is not None
+                and self._last_audio_time is None
+                and now - self._started_at >= NO_AUDIO_WARNING_SECONDS
+            ):
+                self._no_audio_warned = True
+                if self.system_audio:
+                    print(
+                        "No audio detected yet. Check Screen Recording permission or try --mic-only.",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        "No audio detected yet. Check microphone permission or select a device with --device.",
+                        file=sys.stderr,
+                    )
 
     def _is_speech(self, audio_chunk: np.ndarray) -> bool:
         """Check if audio chunk contains speech using VAD."""
@@ -434,6 +555,7 @@ class Transcriber:
                         speech_buffer = np.append(speech_buffer, mixed_frame)
                         silence_frames = 0
                         in_speech = True
+                        self.state = "listening"
 
                         # Calculate energy for THIS frame only (no double counting)
                         total_mic_energy += np.sum(mic_frame ** 2)
@@ -445,7 +567,9 @@ class Transcriber:
                         silence_frames += 1
 
                         if silence_frames >= silence_threshold_frames:
+                            self.state = "transcribing"
                             text = self._transcribe_audio(speech_buffer)
+                            self.state = "listening"
                             if text:
                                 speaker = self._determine_speaker(total_mic_energy, total_sys_energy)
                                 self._write_transcript(text, speaker=speaker)
@@ -484,9 +608,15 @@ class Transcriber:
             f.write(f"# Transcription - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
 
         self.running = True
+        self.state = "listening"
+        self._started_at = time.monotonic()
+        self._last_audio_time = None
+        self._no_audio_warned = False
 
         worker_thread = Thread(target=self.transcribe_worker, daemon=True)
         worker_thread.start()
+        status_thread = Thread(target=self._status_worker, daemon=True)
+        status_thread.start()
 
         if self.system_audio:
             print(f"Recording → {self.output_file} ({self.speaker_name} / {self.other_name})")
@@ -503,7 +633,6 @@ class Transcriber:
                 reader_thread.start()
 
                 while self.running:
-                    import time
                     time.sleep(0.1)
             else:
                 with sd.InputStream(
@@ -534,11 +663,10 @@ class Transcriber:
 def list_devices():
     """Print available audio input devices."""
     print("Available audio input devices:\n")
-    devices = sd.query_devices()
-    for i, device in enumerate(devices):
-        if device["max_input_channels"] > 0:
-            default = " (default)" if device["name"] == sd.query_devices(kind="input")["name"] else ""
-            print(f"  {i}: {device['name']}{default}")
+    default_name = sd.query_devices(kind="input")["name"]
+    for i, device in get_input_devices():
+        default = " (default)" if device["name"] == default_name else ""
+        print(f"  {i}: {device['name']}{default}")
     print("\nUse --device <number or name> to select")
 
 
@@ -604,6 +732,11 @@ Examples:
         action="store_true",
         help="Show config file location",
     )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Show periodic status updates while recording",
+    )
 
     args = parser.parse_args()
 
@@ -624,6 +757,8 @@ Examples:
         list_devices()
         return
 
+    warn_flag_interactions(args)
+
     # Load config
     config = load_config()
 
@@ -641,14 +776,16 @@ Examples:
 
     # Resolve output path
     output_path = resolve_output_path(config, args.output)
+    output_path, suffixed = ensure_unique_path(output_path)
+    if suffixed:
+        print(f"Output exists; saving to {output_path}")
 
-    # Parse device
-    device = args.device
-    if device is not None:
-        try:
-            device = int(device)
-        except ValueError:
-            pass
+    # Resolve device (mic-only mode)
+    device = None
+    if args.mic_only and args.device is not None:
+        device, device_name = resolve_device(args.device)
+        if device_name:
+            print(f"Using input device: {device_name}")
 
     # Get speaker names
     speaker_name = config["speaker"]["name"]
@@ -668,6 +805,7 @@ Examples:
         other_name=other_name,
         device=device,
         system_audio=system_audio,
+        status_enabled=args.status,
     )
     transcriber.start()
 

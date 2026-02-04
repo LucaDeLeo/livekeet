@@ -63,7 +63,22 @@ livekeet --devices
 
 # Use specific audio device
 livekeet --device "BlackHole 2ch"
+
+# Show periodic status updates
+livekeet --status
 ```
+
+**Flags**
+- `--with`, `-w` Set the other speaker name (for calls)
+- `--mic-only`, `-m` Record microphone only (no system audio)
+- `--multilingual` Use the multilingual model (parakeet-tdt-0.6b-v3)
+- `--model` Choose a model explicitly
+- `--device`, `-d` Select input device by number or name (mic-only)
+- `--devices` List available audio input devices
+- `--init` Create the default config file
+- `--config` Show the config file location
+- `--status` Show periodic status updates while recording
+Note: `--multilingual` overrides `--model` when both are set.
 
 ## Configuration
 
@@ -104,7 +119,8 @@ The filename pattern supports these variables:
 Examples:
 - `"{datetime}.md"` → `2024-01-15-143025.md`
 - `"{date}-meeting.md"` → `2024-01-15-meeting.md`
-- `"transcript.md"` → `transcript.md` (overwrites)
+- `"transcript.md"` → `transcript.md` (auto-suffixes if exists)
+If the resolved filename already exists, livekeet will save to `name-2.md`, `name-3.md`, and so on.
 
 ## How It Works
 
@@ -179,6 +195,8 @@ make build
 Go to System Settings > Privacy & Security > Screen Recording and enable your terminal app.
 
 ### No audio captured
+
+If you see "No audio detected yet", check Screen Recording or microphone permissions.
 
 1. Check audio devices: `livekeet --devices`
 2. Try mic-only mode: `livekeet --mic-only`

@@ -17,6 +17,11 @@ dependencies = [
     "webrtcvad>=2.0.10",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
 [project.scripts]
 livekeet = "livekeet:main"
 
