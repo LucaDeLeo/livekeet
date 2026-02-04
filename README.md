@@ -22,18 +22,16 @@ Uses NVIDIA's Parakeet speech recognition model via MLX for fast, accurate, on-d
 ## Installation
 
 ```bash
-# Clone the repo
 git clone https://github.com/LucaDeLeo/livekeet.git
 cd livekeet
+uv sync && make build
+```
 
-# Install Python dependencies
-uv sync  # or: pip install -e .
+Then run with `uv run livekeet` from the repo directory, or install globally:
 
-# Build the system audio capture tool
-make build
-
-# (Optional) Create config file
-livekeet --init
+```bash
+uv tool install -e .  # Install as global command
+livekeet --init       # Create config file (optional)
 ```
 
 ### Screen Recording Permission
