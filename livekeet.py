@@ -5,11 +5,13 @@ Optimized for Apple Silicon using NVIDIA Parakeet via MLX.
 """
 
 import argparse
+import stat
 import struct
 import subprocess
 import sys
 import tempfile
 import tomllib
+import urllib.request
 import warnings
 import wave
 from datetime import datetime
@@ -35,9 +37,46 @@ VAD_FRAME_MS = 30
 SILENCE_THRESHOLD = 0.6  # seconds of silence to end utterance
 
 # Paths
-AUDIOCAPTURE_PATH = Path(__file__).parent / "audiocapture" / ".build" / "release" / "audiocapture"
+DATA_DIR = Path.home() / ".local" / "share" / "livekeet"
 CONFIG_DIR = Path.home() / ".config" / "livekeet"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
+
+# Audio capture binary - check local (dev) first, then user data dir
+_LOCAL_AUDIOCAPTURE = Path(__file__).parent / "audiocapture" / ".build" / "release" / "audiocapture"
+_INSTALLED_AUDIOCAPTURE = DATA_DIR / "audiocapture"
+
+# GitHub release URL for pre-built binary
+GITHUB_RELEASE_URL = "https://github.com/LucaDeLeo/livekeet/releases/latest/download/audiocapture"
+
+
+def get_audiocapture_path() -> Path:
+    """Get path to audiocapture binary, downloading if needed."""
+    # Prefer local build (development)
+    if _LOCAL_AUDIOCAPTURE.exists():
+        return _LOCAL_AUDIOCAPTURE
+
+    # Use installed binary
+    if _INSTALLED_AUDIOCAPTURE.exists():
+        return _INSTALLED_AUDIOCAPTURE
+
+    # Need to download
+    return _INSTALLED_AUDIOCAPTURE
+
+
+def download_audiocapture() -> bool:
+    """Download the audiocapture binary from GitHub releases."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    print("Downloading audio capture tool...", end=" ", flush=True)
+    try:
+        urllib.request.urlretrieve(GITHUB_RELEASE_URL, _INSTALLED_AUDIOCAPTURE)
+        # Make executable
+        _INSTALLED_AUDIOCAPTURE.chmod(_INSTALLED_AUDIOCAPTURE.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        print("done")
+        return True
+    except Exception as e:
+        print(f"failed: {e}")
+        return False
 
 # Default configuration
 DEFAULT_CONFIG = """\
@@ -55,7 +94,10 @@ filename = "{datetime}.md"
 name = "Me"
 
 [defaults]
-# Model: parakeet-tdt-0.6b-v2 (fast), parakeet-tdt-0.6b-v3, parakeet-tdt-1.1b (accurate)
+# Available models (downloaded automatically on first use):
+#   mlx-community/parakeet-tdt-0.6b-v2  - Fast, English only (default)
+#   mlx-community/parakeet-tdt-0.6b-v3  - Fast, multilingual
+#   mlx-community/parakeet-tdt-1.1b     - Slower, English, highest accuracy
 model = "mlx-community/parakeet-tdt-0.6b-v2"
 """
 
@@ -88,12 +130,22 @@ def init_config() -> None:
 
     if CONFIG_FILE.exists():
         print(f"Config already exists: {CONFIG_FILE}")
-        print("Edit it to customize settings.")
     else:
         with open(CONFIG_FILE, "w") as f:
             f.write(DEFAULT_CONFIG)
-        print(f"Created config: {CONFIG_FILE}")
-        print("Edit it to set your name and output preferences.")
+        print(f"Created: {CONFIG_FILE}")
+
+    print("""
+Settings:
+  speaker.name     Your name in transcripts
+  output.directory Where to save files (default: current dir)
+  output.filename  Pattern: {date}, {time}, {datetime}
+  defaults.model   Speech recognition model
+
+Models (downloaded on first use):
+  parakeet-tdt-0.6b-v2  Fast, English only (default)
+  parakeet-tdt-0.6b-v3  Fast, multilingual (--multilingual)
+  parakeet-tdt-1.1b     Slower, English, highest accuracy""")
 
 
 def resolve_output_path(config: dict, output_arg: str | None) -> Path:
@@ -131,30 +183,50 @@ class AudioCaptureProcess:
     Output is stereo: left channel = mic (you), right channel = system (other).
     """
 
+    # Keywords that indicate an error message worth showing
+    ERROR_KEYWORDS = ["error", "failed", "denied", "permission", "not found", "cannot", "unable"]
+
     def __init__(self, include_mic: bool = True):
         self.include_mic = include_mic
         self.process: subprocess.Popen | None = None
         self.running = False
+        self._stderr_thread: Thread | None = None
+
+    def _stderr_reader(self):
+        """Read stderr and only print error-related messages."""
+        if not self.process or not self.process.stderr:
+            return
+        for line in self.process.stderr:
+            line_str = line.decode("utf-8", errors="replace").strip()
+            # Only show lines that look like errors
+            line_lower = line_str.lower()
+            if any(kw in line_lower for kw in self.ERROR_KEYWORDS):
+                print(f"[audio] {line_str}", file=sys.stderr)
 
     def start(self) -> None:
         """Start the audio capture subprocess."""
-        if not AUDIOCAPTURE_PATH.exists():
+        audiocapture_path = get_audiocapture_path()
+        if not audiocapture_path.exists():
             raise FileNotFoundError(
-                f"Audio capture tool not found at {AUDIOCAPTURE_PATH}\n"
-                "Build it with: make build"
+                "Audio capture tool not found. "
+                "Run 'make build' or check your internet connection."
             )
 
-        cmd = [str(AUDIOCAPTURE_PATH)]
+        cmd = [str(audiocapture_path)]
         if not self.include_mic:
             cmd.append("--no-mic")
 
         self.process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=sys.stderr,
+            stderr=subprocess.PIPE,  # Capture stderr to filter errors
             bufsize=0,
         )
         self.running = True
+
+        # Start stderr reader thread to surface errors only
+        self._stderr_thread = Thread(target=self._stderr_reader, daemon=True)
+        self._stderr_thread.start()
 
     def read_chunk(self, num_samples: int) -> tuple[np.ndarray, np.ndarray] | None:
         """Read stereo audio samples from subprocess.
@@ -223,9 +295,10 @@ class Transcriber:
         self.running = False
         self.audio_capture: AudioCaptureProcess | None = None
 
-        print(f"Loading model: {model_name}")
+        short_name = model_name.split("/")[-1] if "/" in model_name else model_name
+        print(f"Loading {short_name}...", end=" ", flush=True)
         self.model = from_pretrained(model_name)
-        print("Model loaded")
+        print("ready")
 
         # VAD setup
         self.vad = webrtcvad.Vad(2)
@@ -291,21 +364,16 @@ class Transcriber:
     def _determine_speaker(self, mic_energy: float, sys_energy: float) -> str | None:
         """Determine who was speaking based on channel energy.
 
-        Uses a ratio-based approach with hysteresis to avoid flip-flopping.
-        Returns speaker name, or None if uncertain.
+        Returns speaker name, or None if uncertain (35-65% split).
         """
-        # Mic-only mode: no system audio, so no speaker detection
-        if sys_energy == 0.0 and mic_energy > 0:
-            return None  # Mic-only mode, don't label
-
         total = mic_energy + sys_energy
+
         if total < 1e-6:
             return None  # Too quiet to determine
 
         mic_ratio = mic_energy / total
 
         # Use 65/35 threshold for clearer separation
-        # Only label when confident (>65% from one source)
         if mic_ratio > 0.65:
             return self.speaker_name
         elif mic_ratio < 0.35:
@@ -354,7 +422,8 @@ class Transcriber:
                     if has_system_audio and len(sys_buffer) >= self.vad_frame_size:
                         sys_frame = sys_buffer[:self.vad_frame_size]
                         sys_buffer = sys_buffer[self.vad_frame_size:]
-                        mixed_frame = mic_frame + sys_frame
+                        # Average the channels (not sum) to keep in [-1, 1] range for VAD
+                        mixed_frame = (mic_frame + sys_frame) * 0.5
                     else:
                         sys_frame = None
                         mixed_frame = mic_frame
@@ -420,11 +489,9 @@ class Transcriber:
         worker_thread.start()
 
         if self.system_audio:
-            print(f"\nRecording (system audio + mic)...")
-            print(f"Speaker detection: {self.speaker_name} (mic) / {self.other_name} (system)")
+            print(f"Recording → {self.output_file} ({self.speaker_name} / {self.other_name})")
         else:
-            print(f"\nRecording (mic only)...")
-        print(f"Output: {self.output_file}")
+            print(f"Recording → {self.output_file}")
         print("Press Ctrl+C to stop\n")
 
         try:
@@ -449,7 +516,7 @@ class Transcriber:
                     while self.running:
                         sd.sleep(100)
         except KeyboardInterrupt:
-            print("\nStopping...")
+            pass
         finally:
             self.stop()
 
@@ -461,7 +528,7 @@ class Transcriber:
             self.audio_capture = None
         with open(self.output_file, "a") as f:
             f.write(f"\n---\n*Ended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n")
-        print(f"Transcript saved to: {self.output_file}")
+        print(f"\nSaved: {self.output_file}")
 
 
 def list_devices():
@@ -503,6 +570,11 @@ Examples:
         "--mic-only", "-m",
         action="store_true",
         help="Only capture microphone (no system audio)",
+    )
+    parser.add_argument(
+        "--multilingual",
+        action="store_true",
+        help="Use multilingual model (parakeet-tdt-0.6b-v3)",
     )
     parser.add_argument(
         "--device", "-d",
@@ -557,11 +629,15 @@ Examples:
 
     # Check system audio requirements
     system_audio = not args.mic_only
-    if system_audio and not AUDIOCAPTURE_PATH.exists():
-        print(f"Error: System audio capture not built")
-        print(f"Run: make build")
-        print(f"Or use --mic-only to capture microphone only")
-        sys.exit(1)
+    if system_audio:
+        audiocapture_path = get_audiocapture_path()
+        if not audiocapture_path.exists():
+            # Try to download
+            if not download_audiocapture():
+                print("Error: Could not get audio capture tool")
+                print("Try: git clone the repo and run 'make build'")
+                print("Or use --mic-only to capture microphone only")
+                sys.exit(1)
 
     # Resolve output path
     output_path = resolve_output_path(config, args.output)
@@ -579,7 +655,10 @@ Examples:
     other_name = args.other_speaker or "Other"
 
     # Get model
-    model = args.model or config["defaults"]["model"]
+    if args.multilingual:
+        model = "mlx-community/parakeet-tdt-0.6b-v3"
+    else:
+        model = args.model or config["defaults"]["model"]
 
     # Start transcription
     transcriber = Transcriber(
