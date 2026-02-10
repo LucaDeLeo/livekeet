@@ -22,7 +22,6 @@ from queue import Empty, Queue
 from threading import Thread
 
 # Suppress known warnings before importing ML libraries
-warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
 warnings.filterwarnings("ignore", message="torchcodec is not installed")
 warnings.filterwarnings("ignore", message="std\\(\\): degrees of freedom")
 warnings.filterwarnings("ignore", category=RuntimeWarning, message="Mean of empty slice")

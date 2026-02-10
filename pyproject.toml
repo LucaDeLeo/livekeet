@@ -12,9 +12,8 @@ requires-python = ">=3.12"
 dependencies = [
     "numpy<2.4",
     "parakeet-mlx>=0.5.0",
-    "setuptools",
     "sounddevice>=0.5.5",
-    "webrtcvad>=2.0.10",
+    "webrtcvad-wheels>=2.0.10",
 ]
 
 [project.optional-dependencies]
