@@ -35,6 +35,8 @@ import webrtcvad
 SAMPLE_RATE = 16000
 VAD_FRAME_MS = 30
 SILENCE_THRESHOLD = 0.6  # seconds of silence to end utterance
+MIN_SPEECH_DURATION = 0.5  # minimum seconds of speech frames to transcribe
+MIN_AUDIO_ENERGY = 0.005  # RMS energy floor to reject near-silent segments
 STATUS_INTERVAL = 10  # seconds between status updates
 NO_AUDIO_WARNING_SECONDS = 10
 
@@ -389,8 +391,9 @@ class Transcriber:
         print("ready")
 
         # VAD setup (separate instances — webrtcvad is stateful)
-        self.mic_vad = webrtcvad.Vad(2)
-        self.sys_vad = webrtcvad.Vad(2)
+        # Aggressiveness 3 = most aggressive filtering of non-speech
+        self.mic_vad = webrtcvad.Vad(3)
+        self.sys_vad = webrtcvad.Vad(3)
         self.vad_frame_size = int(SAMPLE_RATE * VAD_FRAME_MS / 1000)
 
         # Locks for shared resources
@@ -466,7 +469,12 @@ class Transcriber:
 
     def _transcribe_audio(self, audio: np.ndarray) -> str:
         """Transcribe audio segment."""
-        if len(audio) < SAMPLE_RATE * 0.3:
+        if len(audio) < SAMPLE_RATE * MIN_SPEECH_DURATION:
+            return ""
+
+        # Reject near-silent segments (background noise that slipped past VAD)
+        rms = np.sqrt(np.mean(audio ** 2))
+        if rms < MIN_AUDIO_ENERGY:
             return ""
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
@@ -488,6 +496,11 @@ class Transcriber:
     def _flush_speech_segment(self, speech_frames: list[np.ndarray], speaker: str) -> None:
         """Transcribe and write one completed speech segment."""
         if not speech_frames:
+            return
+
+        # Require minimum number of speech frames to avoid noise-triggered hallucinations
+        min_frames = int(MIN_SPEECH_DURATION * SAMPLE_RATE / self.vad_frame_size)
+        if len(speech_frames) < min_frames:
             return
 
         speech_audio = np.concatenate(speech_frames)
