@@ -52,6 +52,96 @@ _INSTALLED_AUDIOCAPTURE = DATA_DIR / "audiocapture"
 # GitHub release URL for pre-built binary
 GITHUB_RELEASE_URL = "https://github.com/LucaDeLeo/livekeet/releases/latest/download/audiocapture"
 
+# Update checking
+_GITHUB_REPO = "LucaDeLeo/livekeet"
+_PACKAGE_NAME = "livekeet"
+_UPDATE_CACHE = CONFIG_DIR / "update_check.json"
+
+
+def _installed_version() -> str:
+    from importlib.metadata import version
+    return version(_PACKAGE_NAME)
+
+
+def _latest_version() -> str | None:
+    """Fetch latest version from GitHub (3s timeout)."""
+    import json as _json
+    url = f"https://raw.githubusercontent.com/{_GITHUB_REPO}/main/pyproject.toml"
+    try:
+        with urllib.request.urlopen(url, timeout=3) as resp:
+            content = resp.read().decode()
+        match = re.search(r'version\s*=\s*"([^"]+)"', content)
+        return match.group(1) if match else None
+    except Exception:
+        return None
+
+
+def _read_update_cache() -> dict:
+    try:
+        import json as _json
+        return _json.loads(_UPDATE_CACHE.read_text()) if _UPDATE_CACHE.exists() else {}
+    except Exception:
+        return {}
+
+
+def _write_update_cache(latest: str) -> None:
+    try:
+        import json as _json
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        _UPDATE_CACHE.write_text(_json.dumps({
+            "latest_version": latest,
+            "checked_at": time.time(),
+        }))
+    except Exception:
+        pass
+
+
+def check_for_update() -> None:
+    """Print a notice to stderr if an update is available. Cached for 24h."""
+    try:
+        cache = _read_update_cache()
+        if time.time() - cache.get("checked_at", 0) < 86400:
+            latest = cache.get("latest_version")
+        else:
+            latest = _latest_version()
+            if latest:
+                _write_update_cache(latest)
+        if latest and latest != _installed_version():
+            print(
+                f"Update available: {_installed_version()} → {latest}. "
+                f"Run `livekeet update` to update.",
+                file=sys.stderr,
+            )
+    except Exception:
+        pass
+
+
+def run_update() -> None:
+    """Check for and install updates."""
+    current = _installed_version()
+    print(f"Current version: {current}")
+    print("Checking for updates...")
+    latest = _latest_version()
+    if latest is None:
+        print("Could not check for updates. Are you online?")
+        sys.exit(1)
+    if latest == current:
+        print("Already up to date.")
+        _write_update_cache(latest)
+        return
+    print(f"Updating: {current} → {latest}")
+    result = subprocess.run(
+        ["uv", "tool", "install", "--force",
+         f"git+https://github.com/{_GITHUB_REPO}.git"],
+    )
+    if result.returncode == 0:
+        print(f"\nUpdated to v{latest}.")
+        _write_update_cache(latest)
+    else:
+        print(f"\nUpdate failed. Try manually:")
+        print(f"  uv tool install --force git+https://github.com/{_GITHUB_REPO}.git")
+        sys.exit(1)
+
 
 def get_audiocapture_path() -> Path:
     """Get path to audiocapture binary, downloading if needed."""
@@ -648,6 +738,11 @@ def list_devices():
 
 
 def main():
+    # Handle subcommands before argparse
+    if len(sys.argv) >= 2 and sys.argv[1] == "update":
+        run_update()
+        return
+
     parser = argparse.ArgumentParser(
         description="Real-time audio transcription to markdown",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -658,7 +753,12 @@ Examples:
   livekeet --with "John"    Label other speaker as "John"
   livekeet --mic-only       Only capture microphone (no system audio)
   livekeet --init           Create config file
+  livekeet update           Update to latest version
         """,
+    )
+    parser.add_argument(
+        "--version", action="version",
+        version=f"livekeet {_installed_version()}",
     )
     parser.add_argument(
         "output",
@@ -732,6 +832,8 @@ Examples:
     if args.devices:
         list_devices()
         return
+
+    check_for_update()
 
     warn_flag_interactions(args)
 
