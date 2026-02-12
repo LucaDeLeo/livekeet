@@ -19,7 +19,7 @@ import wave
 from datetime import datetime
 from pathlib import Path
 from queue import Empty, Queue
-from threading import Thread
+from threading import Lock, Thread
 
 # Suppress known warnings before importing ML libraries
 warnings.filterwarnings("ignore", message="torchcodec is not installed")
@@ -97,9 +97,8 @@ name = "Me"
 
 [defaults]
 # Available models (downloaded automatically on first use):
-#   mlx-community/parakeet-tdt-0.6b-v2  - Fast, English only (default)
-#   mlx-community/parakeet-tdt-0.6b-v3  - Fast, multilingual
-#   mlx-community/parakeet-tdt-1.1b     - Slower, English, highest accuracy
+#   mlx-community/parakeet-tdt-0.6b-v2 - English, highest accuracy (default)
+#   mlx-community/parakeet-tdt-0.6b-v3  - Multilingual, 25 languages
 model = "mlx-community/parakeet-tdt-0.6b-v2"
 """
 
@@ -145,9 +144,8 @@ Settings:
   defaults.model   Speech recognition model
 
 Models (downloaded on first use):
-  parakeet-tdt-0.6b-v2  Fast, English only (default)
-  parakeet-tdt-0.6b-v3  Fast, multilingual (--multilingual)
-  parakeet-tdt-1.1b     Slower, English, highest accuracy""")
+  parakeet-tdt-0.6b-v2  English, highest accuracy (default)
+  parakeet-tdt-0.6b-v3  Multilingual, 25 languages (--multilingual)""")
 
 
 def resolve_output_path(config: dict, output_arg: str | None) -> Path:
@@ -375,7 +373,8 @@ class Transcriber:
         self.other_name = other_name
         self.system_audio = system_audio
         self.status_enabled = status_enabled
-        self.audio_queue: Queue = Queue()
+        self.mic_queue: Queue = Queue()
+        self.sys_queue: Queue = Queue()
         self.running = False
         self.audio_capture: AudioCaptureProcess | None = None
         self.state = "listening"
@@ -389,9 +388,14 @@ class Transcriber:
         self.model = from_pretrained(model_name)
         print("ready")
 
-        # VAD setup
-        self.vad = webrtcvad.Vad(2)
+        # VAD setup (separate instances — webrtcvad is stateful)
+        self.mic_vad = webrtcvad.Vad(2)
+        self.sys_vad = webrtcvad.Vad(2)
         self.vad_frame_size = int(SAMPLE_RATE * VAD_FRAME_MS / 1000)
+
+        # Locks for shared resources
+        self._model_lock = Lock()
+        self._write_lock = Lock()
 
     def audio_callback(self, indata, frames, time_info, status):
         """Called by sounddevice for each audio chunk (mic-only mode)."""
@@ -403,8 +407,7 @@ class Transcriber:
         else:
             mono = indata.flatten()
         self._last_audio_time = time.monotonic()
-        # In mic-only mode: (mic_audio, None) - no system audio
-        self.audio_queue.put((mono.astype(np.float32), None))
+        self.mic_queue.put(mono.astype(np.float32))
 
     def system_audio_reader(self):
         """Background thread that reads stereo audio from the capture subprocess."""
@@ -415,13 +418,13 @@ class Transcriber:
             if result is not None:
                 mic_audio, system_audio = result
                 self._last_audio_time = time.monotonic()
-                while self.audio_queue.qsize() > max_queue_size:
-                    try:
-                        self.audio_queue.get_nowait()
-                    except:
-                        break
-                # Queue both channels separately for per-frame energy calculation
-                self.audio_queue.put((mic_audio, system_audio))
+                for q, chunk in ((self.mic_queue, mic_audio), (self.sys_queue, system_audio)):
+                    while q.qsize() > max_queue_size:
+                        try:
+                            q.get_nowait()
+                        except Empty:
+                            break
+                    q.put(chunk)
 
     def _status_worker(self):
         """Periodic status updates and no-audio warnings."""
@@ -452,12 +455,12 @@ class Transcriber:
                         file=sys.stderr,
                     )
 
-    def _is_speech(self, audio_chunk: np.ndarray) -> bool:
+    def _is_speech(self, audio_chunk: np.ndarray, vad: webrtcvad.Vad) -> bool:
         """Check if audio chunk contains speech using VAD."""
         audio_int16 = (audio_chunk * 32767).astype(np.int16)
         audio_bytes = struct.pack(f"{len(audio_int16)}h", *audio_int16)
         try:
-            return self.vad.is_speech(audio_bytes, SAMPLE_RATE)
+            return vad.is_speech(audio_bytes, SAMPLE_RATE)
         except Exception:
             return False
 
@@ -476,114 +479,62 @@ class Transcriber:
                 wav.writeframes(audio_int16.tobytes())
 
         try:
-            result = self.model.transcribe(temp_path)
+            with self._model_lock:
+                result = self.model.transcribe(temp_path)
             return result.text.strip()
         finally:
             Path(temp_path).unlink(missing_ok=True)
 
-    def _determine_speaker(self, mic_energy: float, sys_energy: float) -> str | None:
-        """Determine who was speaking based on channel energy.
+    def _flush_speech_segment(self, speech_frames: list[np.ndarray], speaker: str) -> None:
+        """Transcribe and write one completed speech segment."""
+        if not speech_frames:
+            return
 
-        Returns speaker name, or None if uncertain (35-65% split).
-        """
-        total = mic_energy + sys_energy
+        speech_audio = np.concatenate(speech_frames)
+        self.state = "transcribing"
+        text = self._transcribe_audio(speech_audio)
+        self.state = "listening"
+        if not text:
+            return
 
-        if total < 1e-6:
-            return None  # Too quiet to determine
+        self._write_transcript(text, speaker=speaker)
 
-        mic_ratio = mic_energy / total
-
-        # Use 65/35 threshold for clearer separation
-        if mic_ratio > 0.65:
-            return self.speaker_name
-        elif mic_ratio < 0.35:
-            return self.other_name
-        else:
-            # Ambiguous - could be crosstalk, echo, or both speaking
-            return None
-
-    def transcribe_worker(self):
-        """Background thread that detects speech end and transcribes.
-
-        Keeps mic and system audio in separate buffers to calculate energy
-        per VAD frame accurately for speaker detection.
-        """
-        # Separate buffers for each channel
-        mic_buffer = np.array([], dtype=np.float32)
-        sys_buffer = np.array([], dtype=np.float32)
-
-        # Speech accumulation buffers
-        speech_buffer = np.array([], dtype=np.float32)  # Mixed audio for transcription
+    def channel_worker(self, queue: Queue, speaker: str, vad: webrtcvad.Vad):
+        """Background thread that runs VAD + transcription for one audio channel."""
+        buffer = np.array([], dtype=np.float32)
+        speech_frames: list[np.ndarray] = []
         silence_frames = 0
         in_speech = False
         silence_threshold_frames = int(SILENCE_THRESHOLD * SAMPLE_RATE / self.vad_frame_size)
 
-        # Track energy per speech frame for speaker detection
-        total_mic_energy = 0.0
-        total_sys_energy = 0.0
-        has_system_audio = False  # Track if we're in system audio mode
-
         while self.running:
             try:
-                queue_item = self.audio_queue.get(timeout=0.1)
-                mic_chunk, sys_chunk = queue_item
+                chunk = queue.get(timeout=0.1)
+                buffer = np.append(buffer, chunk)
 
-                # Append to channel buffers
-                mic_buffer = np.append(mic_buffer, mic_chunk)
-                if sys_chunk is not None:
-                    sys_buffer = np.append(sys_buffer, sys_chunk)
-                    has_system_audio = True
+                while len(buffer) >= self.vad_frame_size:
+                    frame = buffer[:self.vad_frame_size]
+                    buffer = buffer[self.vad_frame_size:]
 
-                # Process in VAD frame-sized chunks
-                while len(mic_buffer) >= self.vad_frame_size:
-                    mic_frame = mic_buffer[:self.vad_frame_size]
-                    mic_buffer = mic_buffer[self.vad_frame_size:]
-
-                    if has_system_audio and len(sys_buffer) >= self.vad_frame_size:
-                        sys_frame = sys_buffer[:self.vad_frame_size]
-                        sys_buffer = sys_buffer[self.vad_frame_size:]
-                        # Average the channels (not sum) to keep in [-1, 1] range for VAD
-                        mixed_frame = (mic_frame + sys_frame) * 0.5
-                    else:
-                        sys_frame = None
-                        mixed_frame = mic_frame
-
-                    is_speech = self._is_speech(mixed_frame)
-
-                    if is_speech:
-                        speech_buffer = np.append(speech_buffer, mixed_frame)
+                    if self._is_speech(frame, vad):
+                        speech_frames.append(frame.copy())
                         silence_frames = 0
                         in_speech = True
-                        self.state = "listening"
-
-                        # Calculate energy for THIS frame only (no double counting)
-                        total_mic_energy += np.sum(mic_frame ** 2)
-                        if sys_frame is not None:
-                            total_sys_energy += np.sum(sys_frame ** 2)
-
                     elif in_speech:
-                        speech_buffer = np.append(speech_buffer, mixed_frame)
                         silence_frames += 1
-
                         if silence_frames >= silence_threshold_frames:
-                            self.state = "transcribing"
-                            text = self._transcribe_audio(speech_buffer)
-                            self.state = "listening"
-                            if text:
-                                speaker = self._determine_speaker(total_mic_energy, total_sys_energy)
-                                self._write_transcript(text, speaker=speaker)
-
-                            # Reset for next utterance
-                            speech_buffer = np.array([], dtype=np.float32)
+                            self._flush_speech_segment(speech_frames, speaker)
+                            speech_frames = []
                             silence_frames = 0
                             in_speech = False
-                            total_mic_energy = 0.0
-                            total_sys_energy = 0.0
 
             except Empty:
                 continue
             except Exception as e:
                 print(f"Transcription error: {e}", file=sys.stderr)
+
+        if speech_frames:
+            self._flush_speech_segment(speech_frames, speaker)
 
     def _write_transcript(self, text: str, speaker: str | None = None):
         """Append transcribed text to output file."""
@@ -596,10 +547,11 @@ class Transcriber:
             line = f"[{timestamp}] {text}\n"
             console = f"[{timestamp}] {text}"
 
-        with open(self.output_file, "a") as f:
-            f.write(line)
-            f.flush()
-        print(console)
+        with self._write_lock:
+            with open(self.output_file, "a") as f:
+                f.write(line)
+                f.flush()
+            print(console)
 
     def start(self):
         """Start transcription."""
@@ -612,8 +564,21 @@ class Transcriber:
         self._last_audio_time = None
         self._no_audio_warned = False
 
-        worker_thread = Thread(target=self.transcribe_worker, daemon=True)
-        worker_thread.start()
+        mic_worker = Thread(
+            target=self.channel_worker,
+            args=(self.mic_queue, self.speaker_name, self.mic_vad),
+            daemon=True,
+        )
+        mic_worker.start()
+
+        if self.system_audio:
+            sys_worker = Thread(
+                target=self.channel_worker,
+                args=(self.sys_queue, self.other_name, self.sys_vad),
+                daemon=True,
+            )
+            sys_worker.start()
+
         status_thread = Thread(target=self._status_worker, daemon=True)
         status_thread.start()
 
@@ -717,7 +682,6 @@ Examples:
         choices=[
             "mlx-community/parakeet-tdt-0.6b-v2",
             "mlx-community/parakeet-tdt-0.6b-v3",
-            "mlx-community/parakeet-tdt-1.1b",
         ],
         help="Model to use (default: from config)",
     )
