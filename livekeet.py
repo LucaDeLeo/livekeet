@@ -458,6 +458,7 @@ class Transcriber:
         device=None,
         system_audio: bool = True,
         status_enabled: bool = False,
+        diarize: bool = False,
     ):
         self.output_file = output_file
         self.device = device
@@ -465,6 +466,7 @@ class Transcriber:
         self.other_name = other_name
         self.system_audio = system_audio
         self.status_enabled = status_enabled
+        self.diarize = diarize
         self.mic_queue: Queue = Queue()
         self.sys_queue: Queue = Queue()
         self.running = False
@@ -479,6 +481,24 @@ class Transcriber:
         from parakeet_mlx import from_pretrained
         self.model = from_pretrained(model_name)
         print("ready")
+
+        # Speaker diarization (optional)
+        self.embedder = None
+        self.mic_tracker = None
+        self.sys_tracker = None
+        if diarize:
+            from diarization import SpeakerTracker, load_embedder
+            print("Loading speaker embeddings...", end=" ", flush=True)
+            self.embedder = load_embedder()
+            self.mic_tracker = SpeakerTracker(
+                primary_name=speaker_name,
+                secondary_prefix="Local",
+            )
+            self.sys_tracker = SpeakerTracker(
+                primary_name=other_name,
+                secondary_prefix="Remote",
+            )
+            print("ready")
 
         # VAD setup (separate instances — webrtcvad is stateful)
         # Aggressiveness 3 = most aggressive filtering of non-speech
@@ -583,7 +603,11 @@ class Transcriber:
         finally:
             Path(temp_path).unlink(missing_ok=True)
 
-    def _flush_speech_segment(self, speech_frames: list[np.ndarray], speaker: str) -> None:
+    def _fallback_speaker(self, channel: str) -> str:
+        """Return the default speaker label for a channel."""
+        return self.speaker_name if channel == "mic" else self.other_name
+
+    def _flush_speech_segment(self, speech_frames: list[np.ndarray], channel: str) -> None:
         """Transcribe and write one completed speech segment."""
         if not speech_frames:
             return
@@ -594,6 +618,23 @@ class Transcriber:
             return
 
         speech_audio = np.concatenate(speech_frames)
+
+        if self.diarize and self.embedder is not None:
+            # Mel computation outside lock (CPU-only, ~5ms)
+            mel = self.embedder.compute_mel(speech_audio)
+            if mel is not None:
+                with self._model_lock:
+                    embedding = self.embedder.extract_embedding_from_mel(mel)
+                if embedding is not None:
+                    tracker = self.mic_tracker if channel == "mic" else self.sys_tracker
+                    speaker = tracker.identify(embedding)
+                else:
+                    speaker = self._fallback_speaker(channel)
+            else:
+                speaker = self._fallback_speaker(channel)
+        else:
+            speaker = self._fallback_speaker(channel)
+
         self.state = "transcribing"
         text = self._transcribe_audio(speech_audio)
         self.state = "listening"
@@ -602,7 +643,7 @@ class Transcriber:
 
         self._write_transcript(text, speaker=speaker)
 
-    def channel_worker(self, queue: Queue, speaker: str, vad: webrtcvad.Vad):
+    def channel_worker(self, queue: Queue, channel: str, vad: webrtcvad.Vad):
         """Background thread that runs VAD + transcription for one audio channel."""
         buffer = np.array([], dtype=np.float32)
         speech_frames: list[np.ndarray] = []
@@ -626,7 +667,7 @@ class Transcriber:
                     elif in_speech:
                         silence_frames += 1
                         if silence_frames >= silence_threshold_frames:
-                            self._flush_speech_segment(speech_frames, speaker)
+                            self._flush_speech_segment(speech_frames, channel)
                             speech_frames = []
                             silence_frames = 0
                             in_speech = False
@@ -637,7 +678,7 @@ class Transcriber:
                 print(f"Transcription error: {e}", file=sys.stderr)
 
         if speech_frames:
-            self._flush_speech_segment(speech_frames, speaker)
+            self._flush_speech_segment(speech_frames, channel)
 
     def _write_transcript(self, text: str, speaker: str | None = None):
         """Append transcribed text to output file."""
@@ -669,7 +710,7 @@ class Transcriber:
 
         mic_worker = Thread(
             target=self.channel_worker,
-            args=(self.mic_queue, self.speaker_name, self.mic_vad),
+            args=(self.mic_queue, "mic", self.mic_vad),
             daemon=True,
         )
         mic_worker.start()
@@ -677,7 +718,7 @@ class Transcriber:
         if self.system_audio:
             sys_worker = Thread(
                 target=self.channel_worker,
-                args=(self.sys_queue, self.other_name, self.sys_vad),
+                args=(self.sys_queue, "system", self.sys_vad),
                 daemon=True,
             )
             sys_worker.start()
@@ -809,6 +850,11 @@ Examples:
         help="Show config file location",
     )
     parser.add_argument(
+        "--diarize",
+        action="store_true",
+        help="Identify individual speakers per audio channel",
+    )
+    parser.add_argument(
         "--status",
         action="store_true",
         help="Show periodic status updates while recording",
@@ -884,6 +930,7 @@ Examples:
         device=device,
         system_audio=system_audio,
         status_enabled=args.status,
+        diarize=args.diarize,
     )
     transcriber.start()
 
