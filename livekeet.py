@@ -766,6 +766,8 @@ class Transcriber:
             pass
         finally:
             self.stop()
+            if self.system_audio:
+                relabel_interactive(self.output_file)
 
     def stop(self):
         """Stop transcription and cleanup."""
@@ -788,6 +790,69 @@ def list_devices():
     print("\nUse --device <number or name> to select")
 
 
+def relabel_interactive(filepath: str | Path) -> None:
+    """Interactively rename speaker labels in a transcript file."""
+    filepath = Path(filepath)
+    if not filepath.exists():
+        print(f"File not found: {filepath}", file=sys.stderr)
+        return
+
+    content = filepath.read_text()
+
+    # Find all unique speaker names
+    speakers = list(dict.fromkeys(re.findall(r'\*\*(.+?)\*\*:', content)))
+    if len(speakers) <= 1:
+        return
+
+    print(f"\nRelabel speakers in {filepath.name}:")
+
+    try:
+        for speaker in speakers:
+            # Gather all transcript lines for this speaker
+            quotes = []
+            for line in content.splitlines():
+                match = re.search(rf'\*\*{re.escape(speaker)}\*\*:\s*(.+)', line)
+                if match:
+                    text = match.group(1).strip()
+                    if text:
+                        quotes.append(text[:80] + "..." if len(text) > 80 else text)
+
+            shown = 0
+            batch = 3
+
+            while True:
+                # Show speaker info and quotes
+                end = min(shown + batch, len(quotes))
+                if shown == 0:
+                    print(f'\nSpeaker "{speaker}" ({len(quotes)} lines):')
+                for q in quotes[shown:end]:
+                    print(f'  > "{q}"')
+                shown = end
+
+                # Build prompt options
+                options = "(n) Name  "
+                if shown < len(quotes):
+                    options += "(m) More  "
+                options += "(s) Skip: "
+
+                choice = input(f"\n  {options}").strip().lower()
+
+                if choice == "n":
+                    new_name = input("  New name: ").strip()
+                    if new_name and new_name != speaker:
+                        content = content.replace(f"**{speaker}**", f"**{new_name}**")
+                        print(f'  Renamed "{speaker}" → "{new_name}"')
+                    break
+                elif choice == "m" and shown < len(quotes):
+                    continue
+                else:
+                    break
+
+        filepath.write_text(content)
+    except KeyboardInterrupt:
+        print("\n\nRelabeling cancelled.")
+
+
 def main():
     # Handle subcommands before argparse
     if len(sys.argv) >= 2 and sys.argv[1] == "update":
@@ -795,6 +860,12 @@ def main():
         return
     if len(sys.argv) >= 2 and sys.argv[1] == "init":
         init_config()
+        return
+    if len(sys.argv) >= 2 and sys.argv[1] == "relabel":
+        if len(sys.argv) < 3:
+            print("Usage: livekeet relabel <file>")
+            sys.exit(1)
+        relabel_interactive(sys.argv[2])
         return
 
     parser = argparse.ArgumentParser(
@@ -807,8 +878,9 @@ Examples:
   livekeet meetings/        Output into meetings/ directory
   livekeet --with "John"    Label other speaker as "John"
   livekeet --mic-only       Only capture microphone (no system audio)
-  livekeet init             Create config file
-  livekeet update           Update to latest version
+  livekeet relabel notes.md  Rename speakers in existing file
+  livekeet init              Create config file
+  livekeet update            Update to latest version
         """,
     )
     parser.add_argument(

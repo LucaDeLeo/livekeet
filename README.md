@@ -12,6 +12,7 @@ Uses NVIDIA's Parakeet speech recognition model via MLX for fast, accurate, on-d
 - **System audio capture** for transcribing calls, meetings, videos
 - **Microphone capture** for voice notes and dictation
 - **Markdown output** with timestamps and speaker labels
+- **Speaker relabeling** - interactively rename speakers after recording
 - **Configurable** speaker names, output location, filename patterns
 
 ## Requirements
@@ -73,6 +74,9 @@ livekeet --diarize
 
 # Show periodic status updates
 livekeet --status
+
+# Rename speakers in an existing transcript
+livekeet relabel meeting.md
 ```
 
 **Flags**
@@ -83,6 +87,7 @@ livekeet --status
 - `--diarize` Identify individual speakers per audio channel
 - `--device`, `-d` Select input device by number or name (mic-only)
 - `--devices` List available audio input devices
+- `relabel <file>` Interactively rename speakers in a transcript
 - `init` Create the default config file (same as `--init`)
 - `--config` Show the config file location
 - `--status` Show periodic status updates while recording
@@ -178,6 +183,27 @@ The first speaker on each channel gets the primary name. Additional speakers are
 - Diarization works best on **system audio** where each speaker has a clean direct signal
 - **Mic-captured audio** from external sources (e.g. phone speakers) may not separate reliably due to shared acoustic characteristics
 - Works best with **clear turn-taking** (one person speaks at a time)
+
+## Speaker Relabeling
+
+After a recording, livekeet automatically prompts you to rename generic speaker labels (like "Other", "Remote 2") when multiple speakers were detected. You can also relabel any existing transcript:
+
+```bash
+livekeet relabel meeting.md
+```
+
+The interactive flow shows sample quotes from each speaker so you can identify who's who:
+
+```
+Speaker "Remote 2" (8 lines):
+  > "so the deadline is next Friday"
+  > "I'll send the design doc after this"
+  > "yeah that works for me"
+
+  (n) Name  (m) More  (s) Skip:
+```
+
+Press `n` to rename, `m` to see more quotes, or `s` to skip. Press Ctrl+C to cancel relabeling.
 
 ## Models
 
