@@ -245,6 +245,16 @@ def resolve_output_path(config: dict, output_arg: str | None) -> Path:
     if output_arg:
         # CLI argument takes precedence
         path = Path(output_arg)
+        if path.is_dir():
+            # Use config filename pattern inside the given directory
+            now = datetime.now()
+            pattern = config["output"]["filename"]
+            filename = pattern.format(
+                date=now.strftime("%Y-%m-%d"),
+                time=now.strftime("%H-%M-%S"),
+                datetime=now.strftime("%Y-%m-%d-%H%M%S"),
+            )
+            return path / filename
         if not path.suffix:
             path = path.with_suffix(".md")
         return path
@@ -783,6 +793,9 @@ def main():
     if len(sys.argv) >= 2 and sys.argv[1] == "update":
         run_update()
         return
+    if len(sys.argv) >= 2 and sys.argv[1] == "init":
+        init_config()
+        return
 
     parser = argparse.ArgumentParser(
         description="Real-time audio transcription to markdown",
@@ -791,9 +804,10 @@ def main():
 Examples:
   livekeet                  Start transcribing (uses config defaults)
   livekeet meeting.md       Output to meeting.md
+  livekeet meetings/        Output into meetings/ directory
   livekeet --with "John"    Label other speaker as "John"
   livekeet --mic-only       Only capture microphone (no system audio)
-  livekeet --init           Create config file
+  livekeet init             Create config file
   livekeet update           Update to latest version
         """,
     )
@@ -804,7 +818,7 @@ Examples:
     parser.add_argument(
         "output",
         nargs="?",
-        help="Output file (default: from config, usually {datetime}.md)",
+        help="Output file or directory (default: from config, usually {datetime}.md)",
     )
     parser.add_argument(
         "--with", "-w",

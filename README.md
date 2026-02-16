@@ -50,6 +50,9 @@ livekeet
 # Output to specific file
 livekeet meeting.md
 
+# Output into a directory (uses config filename pattern)
+livekeet meetings/
+
 # Name the other speaker (for 1:1 calls)
 livekeet --with "John"
 
@@ -80,7 +83,7 @@ livekeet --status
 - `--diarize` Identify individual speakers per audio channel
 - `--device`, `-d` Select input device by number or name (mic-only)
 - `--devices` List available audio input devices
-- `--init` Create the default config file
+- `init` Create the default config file (same as `--init`)
 - `--config` Show the config file location
 - `--status` Show periodic status updates while recording
 Note: `--multilingual` overrides `--model` when both are set.
@@ -90,7 +93,7 @@ Note: `--multilingual` overrides `--model` when both are set.
 Create a config file to customize defaults:
 
 ```bash
-livekeet --init
+livekeet init
 ```
 
 This creates `~/.config/livekeet/config.toml`:
