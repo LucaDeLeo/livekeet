@@ -110,7 +110,6 @@ name = "Me"
 # Available models (downloaded automatically on first use):
 #   mlx-community/parakeet-tdt-0.6b-v2  - Fast, English only (default)
 #   mlx-community/parakeet-tdt-0.6b-v3  - Fast, multilingual
-#   mlx-community/parakeet-tdt-1.1b     - Slower, English, highest accuracy
 model = "mlx-community/parakeet-tdt-0.6b-v2"
 ```
 
@@ -183,7 +182,6 @@ The first speaker on each channel gets the primary name. Additional speakers are
 |-------|------|-------|-------|
 | parakeet-tdt-0.6b-v2 | 600M | Fast | English only (default) |
 | parakeet-tdt-0.6b-v3 | 600M | Fast | Multilingual (`--multilingual`) |
-| parakeet-tdt-1.1b | 1.1B | Slower | English, highest accuracy |
 
 Models are downloaded automatically on first use.
 

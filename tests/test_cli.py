@@ -46,7 +46,7 @@ def test_resolve_output_path_pattern(monkeypatch, tmp_path):
 
 
 def test_warn_multilingual_overrides_model(capsys):
-    args = SimpleNamespace(multilingual=True, model="mlx-community/parakeet-tdt-1.1b", mic_only=False, other_speaker=None)
+    args = SimpleNamespace(multilingual=True, model="mlx-community/parakeet-tdt-0.6b-v2", mic_only=False, other_speaker=None)
     livekeet.warn_flag_interactions(args)
     captured = capsys.readouterr()
     assert "--multilingual overrides --model" in captured.err
