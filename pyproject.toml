@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "livekeet"
-version = "0.1.9"
+version = "0.1.10"
 description = "Real-time audio transcription to markdown using NVIDIA Parakeet via MLX. Optimized for Apple Silicon."
 readme = "README.md"
 license = "MIT"

@@ -17,7 +17,7 @@ import numpy as np
 
 # Embedding settings
 MIN_AUDIO_SECONDS = 0.5
-SIMILARITY_THRESHOLD = 0.65
+SIMILARITY_THRESHOLD = 0.5
 MAX_SPEAKERS = 5
 MEL_N_FFT = 400  # 25ms window at 16kHz (matches WeSpeaker/Kaldi)
 MEL_HOP_LENGTH = 160  # 10ms hop
