@@ -168,6 +168,19 @@ final class AudioCaptureManager {
     var includeMic: Bool = true
     var micGain: Float = 1.0
 
+    // Thread-safe converter access
+    private var converterLock = os_unfair_lock()
+
+    // System audio health tracking
+    private var systemAudioFrameCount: UInt64 = 0
+
+    // Stream restart state
+    private var restartCount = 0
+    private let maxRestarts = 3
+    private var isRestarting = false
+    private let restartQueue = DispatchQueue(label: "audiocapture.restart")
+    private var lastRestartTime: Date?
+
     init() {
         outputFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: targetSampleRate, channels: 1, interleaved: false)!
     }
@@ -198,6 +211,22 @@ final class AudioCaptureManager {
         }
     }
 
+    // MARK: - Stream Configuration
+
+    private func makeStreamConfig() -> SCStreamConfiguration {
+        let config = SCStreamConfiguration()
+        config.capturesAudio = true
+        config.excludesCurrentProcessAudio = true
+        config.sampleRate = 48000
+        config.channelCount = 2
+        if #available(macOS 13.0, *) { config.queueDepth = 8 }
+        config.width = 2
+        config.height = 2
+        config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
+        config.showsCursor = false
+        return config
+    }
+
     // MARK: - Start Capture
 
     func startCapture() async throws {
@@ -213,21 +242,11 @@ final class AudioCaptureManager {
             throw CaptureError.noDisplay
         }
 
-        let config = SCStreamConfiguration()
-        config.capturesAudio = true
-        config.excludesCurrentProcessAudio = true
-        config.sampleRate = 48000
-        config.channelCount = 2
-        if #available(macOS 13.0, *) { config.queueDepth = 8 }
-        config.width = 2
-        config.height = 2
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
-        config.showsCursor = false
-
+        let config = makeStreamConfig()
         let filter = SCContentFilter(display: display, excludingWindows: [])
-        stream = SCStream(filter: filter, configuration: config, delegate: nil)
 
         outputHandler = StreamOutputHandler(manager: self)
+        stream = SCStream(filter: filter, configuration: config, delegate: outputHandler)
         try stream?.addStreamOutput(outputHandler!, type: .audio, sampleHandlerQueue: .global(qos: .userInteractive))
 
         if includeMic { try startMicrophoneCapture() }
@@ -289,8 +308,17 @@ final class AudioCaptureManager {
     func processSystemAudio(_ sampleBuffer: CMSampleBuffer) {
         guard let pcmBuffer = sampleBuffer.asPCMBuffer else { return }
 
+        os_unfair_lock_lock(&converterLock)
+
+        // Detect format changes (e.g. audio routing switch) and recreate converter
+        if let existing = systemAudioConverter, existing.inputFormat != pcmBuffer.format {
+            fputs("System audio format changed, recreating converter\n", stderr)
+            systemAudioConverter = nil
+        }
+
         if systemAudioConverter == nil {
             guard let converter = AVAudioConverter(from: pcmBuffer.format, to: outputFormat) else {
+                os_unfair_lock_unlock(&converterLock)
                 fputs("Warning: Could not create system audio converter\n", stderr)
                 return
             }
@@ -298,11 +326,21 @@ final class AudioCaptureManager {
             fputs("System audio: \(pcmBuffer.format.sampleRate)Hz, \(pcmBuffer.format.channelCount)ch\n", stderr)
         }
 
-        guard let converter = systemAudioConverter,
-              let samples = convertAndExtractSamples(from: pcmBuffer, using: converter) else {
+        let converter = systemAudioConverter!
+        os_unfair_lock_unlock(&converterLock)
+
+        guard let samples = convertAndExtractSamples(from: pcmBuffer, using: converter) else {
             return
         }
         systemBuffer.write(samples)
+        systemAudioFrameCount += 1
+
+        // Reset restart counter after 60s of stable audio
+        if let lastRestart = lastRestartTime,
+           Date().timeIntervalSince(lastRestart) > 60 {
+            restartCount = 0
+            lastRestartTime = nil
+        }
     }
 
     // MARK: - Microphone Capture
@@ -368,6 +406,9 @@ final class AudioCaptureManager {
 
         var outputStarted = false
         var lastUnderrunReport = 0
+        var lastWatchdogFrameCount: UInt64 = 0
+        var watchdogStaleTicks = 0
+        let watchdogThresholdTicks = 78  // ~5s at 64ms intervals
         weak let weakSelf = self
 
         timer.setEventHandler { [systemBuffer, micBuffer, systemFloats, micFloats, outputBuffer] in
@@ -380,6 +421,19 @@ final class AudioCaptureManager {
                 if sysAvailable < minBufferSamples { return }
                 outputStarted = true
                 fputs("Output started (stereo: L=mic, R=system)\n", stderr)
+            }
+
+            // System audio watchdog: detect stalled stream
+            let currentFrameCount = strongSelf.systemAudioFrameCount
+            if currentFrameCount == lastWatchdogFrameCount {
+                watchdogStaleTicks += 1
+                if watchdogStaleTicks == watchdogThresholdTicks {
+                    fputs("Warning: system audio stalled, attempting restart\n", stderr)
+                    strongSelf.restartCapture()
+                }
+            } else {
+                lastWatchdogFrameCount = currentFrameCount
+                watchdogStaleTicks = 0
             }
 
             // Read from both buffers
@@ -429,6 +483,70 @@ final class AudioCaptureManager {
         timer.resume()
     }
 
+    // MARK: - Restart Capture
+
+    func restartCapture() {
+        restartQueue.async { [weak self] in
+            guard let self, !self.isRestarting else { return }
+            self.isRestarting = true
+            defer { self.isRestarting = false }
+
+            guard self.restartCount < self.maxRestarts else {
+                fputs("Stream restart: max retries (\(self.maxRestarts)) exceeded\n", stderr)
+                return
+            }
+
+            self.restartCount += 1
+            let backoff = pow(2.0, Double(self.restartCount - 1))  // 1s, 2s, 4s
+            fputs("Stream restart: attempt \(self.restartCount)/\(self.maxRestarts) (backoff \(Int(backoff))s)\n", stderr)
+            Thread.sleep(forTimeInterval: backoff)
+
+            // Stop old stream
+            let semaphore = DispatchSemaphore(value: 0)
+            Task {
+                try? await self.stream?.stopCapture()
+                self.stream = nil
+                semaphore.signal()
+            }
+            semaphore.wait()
+
+            // Clear converter under lock
+            os_unfair_lock_lock(&self.converterLock)
+            self.systemAudioConverter = nil
+            os_unfair_lock_unlock(&self.converterLock)
+
+            // Re-query content and create fresh stream
+            let setupSemaphore = DispatchSemaphore(value: 0)
+            var setupError: Error?
+            Task {
+                do {
+                    let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+                    guard let display = content.displays.first else {
+                        throw CaptureError.noDisplay
+                    }
+                    let config = self.makeStreamConfig()
+                    let filter = SCContentFilter(display: display, excludingWindows: [])
+
+                    self.outputHandler = StreamOutputHandler(manager: self)
+                    self.stream = SCStream(filter: filter, configuration: config, delegate: self.outputHandler)
+                    try self.stream?.addStreamOutput(self.outputHandler!, type: .audio, sampleHandlerQueue: .global(qos: .userInteractive))
+
+                    try await self.stream?.startCapture()
+                    self.lastRestartTime = Date()
+                    fputs("Stream restart: success\n", stderr)
+                } catch {
+                    setupError = error
+                }
+                setupSemaphore.signal()
+            }
+            setupSemaphore.wait()
+
+            if let error = setupError {
+                fputs("Stream restart: failed - \(error.localizedDescription)\n", stderr)
+            }
+        }
+    }
+
     // MARK: - Stop
 
     func stop() async {
@@ -459,6 +577,7 @@ final class StreamOutputHandler: NSObject, SCStreamOutput, SCStreamDelegate, @un
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         fputs("Stream error: \(error.localizedDescription)\n", stderr)
+        manager?.restartCapture()
     }
 }
 

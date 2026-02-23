@@ -366,13 +366,14 @@ class AudioCaptureProcess:
     """
 
     # Keywords that indicate an error message worth showing
-    ERROR_KEYWORDS = ["error", "failed", "denied", "permission", "not found", "cannot", "unable", "warning"]
+    ERROR_KEYWORDS = ["error", "failed", "denied", "permission", "not found", "cannot", "unable", "warning", "restart"]
 
     def __init__(self, include_mic: bool = True):
         self.include_mic = include_mic
         self.process: subprocess.Popen | None = None
         self.running = False
         self._stderr_thread: Thread | None = None
+        self._read_buffer = bytearray()
 
     def _stderr_reader(self):
         """Read stderr and only print error-related messages."""
@@ -413,8 +414,10 @@ class AudioCaptureProcess:
     def read_chunk(self, num_samples: int) -> tuple[np.ndarray, np.ndarray] | None:
         """Read stereo audio samples from subprocess.
 
+        Accumulates partial reads across calls to handle short reads from the pipe.
+
         Returns:
-            Tuple of (mic_audio, system_audio) as float32 arrays, or None if no data.
+            Tuple of (mic_audio, system_audio) as float32 arrays, or None on EOF.
             Each array is mono with num_samples samples.
         """
         if not self.process or not self.running:
@@ -423,9 +426,15 @@ class AudioCaptureProcess:
         # Stereo: 2 channels * 2 bytes per sample
         num_bytes = num_samples * 2 * 2
         try:
-            pcm_bytes = self.process.stdout.read(num_bytes)
-            if not pcm_bytes or len(pcm_bytes) < num_bytes:
-                return None
+            while len(self._read_buffer) < num_bytes:
+                remaining = num_bytes - len(self._read_buffer)
+                data = self.process.stdout.read(remaining)
+                if not data:
+                    return None  # EOF
+                self._read_buffer.extend(data)
+
+            pcm_bytes = bytes(self._read_buffer[:num_bytes])
+            self._read_buffer = self._read_buffer[num_bytes:]
 
             # Interleaved stereo: [L0, R0, L1, R1, ...]
             audio_int16 = np.frombuffer(pcm_bytes, dtype=np.int16)
@@ -442,6 +451,7 @@ class AudioCaptureProcess:
     def stop(self) -> None:
         """Stop the audio capture subprocess."""
         self.running = False
+        self._read_buffer.clear()
         if self.process:
             self.process.terminate()
             try:
@@ -485,6 +495,8 @@ class Transcriber:
         self._started_at: float | None = None
         self._last_audio_time: float | None = None
         self._no_audio_warned = False
+        self._last_system_audio_time: float | None = None
+        self._system_audio_warned = False
 
         short_name = model_name.split("/")[-1] if "/" in model_name else model_name
         print(f"Loading {short_name}...", end=" ", flush=True)
@@ -541,6 +553,15 @@ class Transcriber:
             if result is not None:
                 mic_audio, system_audio = result
                 self._last_audio_time = time.monotonic()
+
+                # Track system audio presence by RMS energy
+                sys_rms = float(np.sqrt(np.mean(system_audio ** 2)))
+                if sys_rms > 0.001:
+                    self._last_system_audio_time = time.monotonic()
+                    if self._system_audio_warned:
+                        print("System audio recovered", file=sys.stderr)
+                        self._system_audio_warned = False
+
                 for q, chunk in ((self.mic_queue, mic_audio), (self.sys_queue, system_audio)):
                     while q.qsize() > max_queue_size:
                         try:
@@ -577,6 +598,19 @@ class Transcriber:
                         "No audio detected yet. Check microphone permission or select a device with --device.",
                         file=sys.stderr,
                     )
+
+            # Detect system audio going silent mid-session
+            if (
+                self.system_audio
+                and not self._system_audio_warned
+                and self._last_system_audio_time is not None
+                and now - self._last_system_audio_time > NO_AUDIO_WARNING_SECONDS
+            ):
+                self._system_audio_warned = True
+                print(
+                    "System audio lost. Stream may have stalled — waiting for recovery.",
+                    file=sys.stderr,
+                )
 
     def _is_speech(self, audio_chunk: np.ndarray, vad: webrtcvad.Vad) -> bool:
         """Check if audio chunk contains speech using VAD."""
