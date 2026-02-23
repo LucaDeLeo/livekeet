@@ -4,21 +4,21 @@ build-backend = "hatchling.build"
 
 [project]
 name = "livekeet"
-version = "0.1.5"
+version = "0.1.6"
 description = "Real-time audio transcription to markdown using NVIDIA Parakeet via MLX. Optimized for Apple Silicon."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
-    "numpy<2.4",
-    "parakeet-mlx>=0.5.0",
+    "numpy<2.5",
+    "parakeet-mlx>=0.5.1",
     "sounddevice>=0.5.5",
-    "webrtcvad-wheels>=2.0.10",
+    "webrtcvad-wheels>=2.0.14",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.0",
+    "pytest>=9.0",
 ]
 
 [project.scripts]

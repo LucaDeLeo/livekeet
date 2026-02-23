@@ -150,7 +150,7 @@ final class RingBuffer: @unchecked Sendable {
 
 // MARK: - Audio Capture Manager
 
-final class AudioCaptureManager {
+final class AudioCaptureManager: @unchecked Sendable {
     private var stream: SCStream?
     private var micEngine: AVAudioEngine?
     private var outputHandler: StreamOutputHandler?
@@ -174,12 +174,14 @@ final class AudioCaptureManager {
     // System audio health tracking
     private var systemAudioFrameCount: UInt64 = 0
 
-    // Stream restart state
-    private var restartCount = 0
+    // Stream restart state (protected by restartState lock)
+    private struct RestartState {
+        var count = 0
+        var isRestarting = false
+        var lastTime: Date?
+    }
     private let maxRestarts = 3
-    private var isRestarting = false
-    private let restartQueue = DispatchQueue(label: "audiocapture.restart")
-    private var lastRestartTime: Date?
+    private let restartState = OSAllocatedUnfairLock(initialState: RestartState())
 
     init() {
         outputFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: targetSampleRate, channels: 1, interleaved: false)!
@@ -188,11 +190,7 @@ final class AudioCaptureManager {
     // MARK: - List Devices
 
     func listDevices() {
-        let deviceTypes: [AVCaptureDevice.DeviceType] = if #available(macOS 14.0, *) {
-            [.microphone, .external]
-        } else {
-            [.builtInMicrophone, .externalUnknown]
-        }
+        let deviceTypes: [AVCaptureDevice.DeviceType] = [.microphone, .external]
         let devices = AVCaptureDevice.DiscoverySession(deviceTypes: deviceTypes, mediaType: .audio, position: .unspecified).devices
         fputs("Available microphones:\n", stderr)
         for device in devices {
@@ -219,7 +217,7 @@ final class AudioCaptureManager {
         config.excludesCurrentProcessAudio = true
         config.sampleRate = 48000
         config.channelCount = 2
-        if #available(macOS 13.0, *) { config.queueDepth = 8 }
+        config.queueDepth = 8
         config.width = 2
         config.height = 2
         config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
@@ -273,7 +271,7 @@ final class AudioCaptureManager {
         }
 
         var error: NSError?
-        var consumed = false
+        nonisolated(unsafe) var consumed = false
         let status = converter.convert(to: outputBuffer, error: &error) { _, outStatus in
             if consumed {
                 outStatus.pointee = .noDataNow
@@ -336,11 +334,19 @@ final class AudioCaptureManager {
         systemAudioFrameCount += 1
 
         // Reset restart counter after 60s of stable audio
-        if let lastRestart = lastRestartTime,
-           Date().timeIntervalSince(lastRestart) > 60 {
-            restartCount = 0
-            lastRestartTime = nil
+        restartState.withLock { state in
+            if let lastRestart = state.lastTime,
+               Date().timeIntervalSince(lastRestart) > 60 {
+                state.count = 0
+                state.lastTime = nil
+            }
         }
+    }
+
+    private func clearSystemAudioConverter() {
+        os_unfair_lock_lock(&converterLock)
+        systemAudioConverter = nil
+        os_unfair_lock_unlock(&converterLock)
     }
 
     // MARK: - Microphone Capture
@@ -486,64 +492,54 @@ final class AudioCaptureManager {
     // MARK: - Restart Capture
 
     func restartCapture() {
-        restartQueue.async { [weak self] in
-            guard let self, !self.isRestarting else { return }
-            self.isRestarting = true
-            defer { self.isRestarting = false }
+        Task { await performRestart() }
+    }
 
-            guard self.restartCount < self.maxRestarts else {
-                fputs("Stream restart: max retries (\(self.maxRestarts)) exceeded\n", stderr)
-                return
+    private func performRestart() async {
+        // Atomically check-and-set restart state
+        let attempt: (num: Int, max: Int)? = restartState.withLock { state in
+            guard !state.isRestarting, state.count < maxRestarts else { return nil }
+            state.isRestarting = true
+            state.count += 1
+            return (state.count, maxRestarts)
+        }
+
+        guard let attempt else {
+            if restartState.withLock({ $0.count >= maxRestarts && !$0.isRestarting }) {
+                fputs("Stream restart: max retries (\(maxRestarts)) exceeded\n", stderr)
             }
+            return
+        }
+        defer { restartState.withLock { $0.isRestarting = false } }
 
-            self.restartCount += 1
-            let backoff = pow(2.0, Double(self.restartCount - 1))  // 1s, 2s, 4s
-            fputs("Stream restart: attempt \(self.restartCount)/\(self.maxRestarts) (backoff \(Int(backoff))s)\n", stderr)
-            Thread.sleep(forTimeInterval: backoff)
+        let backoff = pow(2.0, Double(attempt.num - 1))  // 1s, 2s, 4s
+        fputs("Stream restart: attempt \(attempt.num)/\(attempt.max) (backoff \(Int(backoff))s)\n", stderr)
+        try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
 
-            // Stop old stream
-            let semaphore = DispatchSemaphore(value: 0)
-            Task {
-                try? await self.stream?.stopCapture()
-                self.stream = nil
-                semaphore.signal()
+        // Stop old stream
+        try? await stream?.stopCapture()
+        stream = nil
+
+        clearSystemAudioConverter()
+
+        // Re-query content and create fresh stream
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            guard let display = content.displays.first else {
+                throw CaptureError.noDisplay
             }
-            semaphore.wait()
+            let config = makeStreamConfig()
+            let filter = SCContentFilter(display: display, excludingWindows: [])
 
-            // Clear converter under lock
-            os_unfair_lock_lock(&self.converterLock)
-            self.systemAudioConverter = nil
-            os_unfair_lock_unlock(&self.converterLock)
+            outputHandler = StreamOutputHandler(manager: self)
+            stream = SCStream(filter: filter, configuration: config, delegate: outputHandler)
+            try stream?.addStreamOutput(outputHandler!, type: .audio, sampleHandlerQueue: .global(qos: .userInteractive))
 
-            // Re-query content and create fresh stream
-            let setupSemaphore = DispatchSemaphore(value: 0)
-            var setupError: Error?
-            Task {
-                do {
-                    let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-                    guard let display = content.displays.first else {
-                        throw CaptureError.noDisplay
-                    }
-                    let config = self.makeStreamConfig()
-                    let filter = SCContentFilter(display: display, excludingWindows: [])
-
-                    self.outputHandler = StreamOutputHandler(manager: self)
-                    self.stream = SCStream(filter: filter, configuration: config, delegate: self.outputHandler)
-                    try self.stream?.addStreamOutput(self.outputHandler!, type: .audio, sampleHandlerQueue: .global(qos: .userInteractive))
-
-                    try await self.stream?.startCapture()
-                    self.lastRestartTime = Date()
-                    fputs("Stream restart: success\n", stderr)
-                } catch {
-                    setupError = error
-                }
-                setupSemaphore.signal()
-            }
-            setupSemaphore.wait()
-
-            if let error = setupError {
-                fputs("Stream restart: failed - \(error.localizedDescription)\n", stderr)
-            }
+            try await stream?.startCapture()
+            restartState.withLock { $0.lastTime = Date() }
+            fputs("Stream restart: success\n", stderr)
+        } catch {
+            fputs("Stream restart: failed - \(error.localizedDescription)\n", stderr)
         }
     }
 
