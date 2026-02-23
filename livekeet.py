@@ -486,6 +486,7 @@ class Transcriber:
         self.device = device
         self.speaker_name = speaker_name
         self.other_name = other_name
+        self.other_names = other_names or []
         self.system_audio = system_audio
         self.status_enabled = status_enabled
         self.diarize = diarize
@@ -774,7 +775,8 @@ class Transcriber:
         status_thread.start()
 
         if self.system_audio:
-            print(f"Recording → {self.output_file} ({self.speaker_name} / {self.other_name})")
+            others = ", ".join(self.other_names) if self.other_names else self.other_name
+            print(f"Recording → {self.output_file} ({self.speaker_name} / {others})")
         else:
             print(f"Recording → {self.output_file}")
         print("Press Ctrl+C to stop\n")
