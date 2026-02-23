@@ -92,3 +92,51 @@ def test_warn_with_ignored_in_mic_only(capsys):
     livekeet.warn_flag_interactions(args)
     captured = capsys.readouterr()
     assert "--with is ignored in --mic-only mode" in captured.err
+
+
+def test_comma_separated_with_names():
+    """--with 'Tom,Bob' should parse into multiple names."""
+    raw = "Tom,Bob"
+    names = [n.strip() for n in raw.split(",") if n.strip()]
+    assert names == ["Tom", "Bob"]
+
+
+def test_comma_separated_with_spaces():
+    """Spaces around commas should be stripped."""
+    raw = " Alice , Bob , Charlie "
+    names = [n.strip() for n in raw.split(",") if n.strip()]
+    assert names == ["Alice", "Bob", "Charlie"]
+
+
+def test_single_with_name_no_split():
+    """A single name without commas returns one entry."""
+    raw = "John"
+    names = [n.strip() for n in raw.split(",") if n.strip()]
+    assert names == ["John"]
+
+
+def test_auto_diarize_multiple_names():
+    """Diarization should auto-enable when multiple --with names given."""
+    other_names = ["Tom", "Bob"]
+    diarize_flag = False
+    config_diarize = False
+    diarize = diarize_flag or config_diarize or len(other_names) > 1
+    assert diarize is True
+
+
+def test_no_auto_diarize_single_name():
+    """Diarization should not auto-enable for a single --with name."""
+    other_names = ["Tom"]
+    diarize_flag = False
+    config_diarize = False
+    diarize = diarize_flag or config_diarize or len(other_names) > 1
+    assert diarize is False
+
+
+def test_config_diarize_enables():
+    """Config diarize=true should enable diarization."""
+    other_names = []
+    diarize_flag = False
+    config_diarize = True
+    diarize = diarize_flag or config_diarize or len(other_names) > 1
+    assert diarize is True

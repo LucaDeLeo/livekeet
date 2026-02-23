@@ -144,3 +144,35 @@ class TestSpeakerTracker:
             assert tracker.identify(EMB_A) == "Me"
         assert len(tracker.profiles) == 1
         assert tracker.profiles[0].count == 11
+
+    def test_secondary_names_used_before_prefix(self):
+        tracker = SpeakerTracker(
+            primary_name="Tom",
+            secondary_prefix="Remote",
+            secondary_names=["Bob", "Charlie"],
+        )
+        assert tracker.identify(EMB_A) == "Tom"
+        assert tracker.identify(EMB_B) == "Bob"
+        assert tracker.identify(EMB_C) == "Charlie"
+
+    def test_secondary_names_exhausted_falls_back_to_prefix(self):
+        tracker = SpeakerTracker(
+            primary_name="Tom",
+            secondary_prefix="Remote",
+            secondary_names=["Bob"],
+        )
+        assert tracker.identify(EMB_A) == "Tom"
+        assert tracker.identify(EMB_B) == "Bob"
+        assert tracker.identify(EMB_C) == "Remote 3"
+
+    def test_secondary_names_not_mutated(self):
+        names = ["Bob", "Charlie"]
+        tracker = SpeakerTracker(
+            primary_name="Tom",
+            secondary_prefix="Remote",
+            secondary_names=names,
+        )
+        tracker.identify(EMB_A)
+        tracker.identify(EMB_B)
+        # Original list should not be mutated
+        assert names == ["Bob", "Charlie"]

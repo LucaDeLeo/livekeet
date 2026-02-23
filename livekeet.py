@@ -192,6 +192,7 @@ name = "Me"
 #   mlx-community/parakeet-tdt-0.6b-v2 - English, highest accuracy (default)
 #   mlx-community/parakeet-tdt-0.6b-v3  - Multilingual, 25 languages
 model = "mlx-community/parakeet-tdt-0.6b-v2"
+# diarize = false
 """
 
 
@@ -200,7 +201,7 @@ def load_config() -> dict:
     config = {
         "output": {"directory": "", "filename": "{datetime}.md"},
         "speaker": {"name": "Me"},
-        "defaults": {"model": "mlx-community/parakeet-tdt-0.6b-v2"},
+        "defaults": {"model": "mlx-community/parakeet-tdt-0.6b-v2", "diarize": False},
     }
 
     if CONFIG_FILE.exists():
@@ -356,7 +357,7 @@ def warn_flag_interactions(args: argparse.Namespace) -> None:
     if args.multilingual and args.model:
         print("Warning: --multilingual overrides --model", file=sys.stderr)
     if args.mic_only and args.other_speaker:
-        print("Warning: --with is ignored in --mic-only mode", file=sys.stderr)
+        print("Warning: --with is ignored in --mic-only mode (system audio disabled)", file=sys.stderr)
 
 
 class AudioCaptureProcess:
@@ -475,6 +476,7 @@ class Transcriber:
         output_file: Path,
         speaker_name: str = "Me",
         other_name: str = "Other",
+        other_names: list[str] | None = None,
         device=None,
         system_audio: bool = True,
         status_enabled: bool = False,
@@ -519,6 +521,7 @@ class Transcriber:
             self.sys_tracker = SpeakerTracker(
                 primary_name=other_name,
                 secondary_prefix="Remote",
+                secondary_names=other_names[1:] if other_names and len(other_names) > 1 else None,
             )
             print("ready")
 
@@ -930,7 +933,7 @@ Examples:
         "--with", "-w",
         dest="other_speaker",
         metavar="NAME",
-        help="Name of the other speaker (for calls)",
+        help="Other speaker name(s), comma-separated (enables diarization when multiple)",
     )
     parser.add_argument(
         "--mic-only", "-m",
@@ -1031,9 +1034,18 @@ Examples:
         if device_name:
             print(f"Using input device: {device_name}")
 
+    # Parse comma-separated speaker names
+    if args.other_speaker:
+        other_names = [n.strip() for n in args.other_speaker.split(",") if n.strip()]
+    else:
+        other_names = []
+    other_name = other_names[0] if other_names else "Other"
+
     # Get speaker names
     speaker_name = config["speaker"]["name"]
-    other_name = args.other_speaker or "Other"
+
+    # Diarize if flag, config, or multiple --with names
+    diarize = args.diarize or config["defaults"].get("diarize", False) or len(other_names) > 1
 
     # Get model
     if args.multilingual:
@@ -1047,10 +1059,11 @@ Examples:
         output_file=output_path,
         speaker_name=speaker_name,
         other_name=other_name,
+        other_names=other_names,
         device=device,
         system_audio=system_audio,
         status_enabled=args.status,
-        diarize=args.diarize,
+        diarize=diarize,
     )
     transcriber.start()
 

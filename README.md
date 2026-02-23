@@ -9,11 +9,12 @@ Uses NVIDIA's Parakeet speech recognition model via MLX for fast, accurate, on-d
 - **Real-time transcription** with voice activity detection (VAD)
 - **Speaker detection** - automatically labels who's speaking in calls
 - **Speaker diarization** - identify multiple speakers on the same audio channel
+- **Multiple speaker names** - comma-separated `--with "Tom,Bob,Alice"` with auto-diarization
 - **System audio capture** for transcribing calls, meetings, videos
 - **Microphone capture** for voice notes and dictation
 - **Markdown output** with timestamps and speaker labels
 - **Speaker relabeling** - interactively rename speakers after recording
-- **Configurable** speaker names, output location, filename patterns
+- **Configurable** speaker names, output location, filename patterns, diarization default
 
 ## Requirements
 
@@ -57,6 +58,9 @@ livekeet meetings/
 # Name the other speaker (for 1:1 calls)
 livekeet --with "John"
 
+# Multiple speakers (auto-enables diarization)
+livekeet --with "Tom,Bob,Alice"
+
 # Multilingual transcription
 livekeet --multilingual
 
@@ -80,7 +84,7 @@ livekeet relabel meeting.md
 ```
 
 **Flags**
-- `--with`, `-w` Set the other speaker name (for calls)
+- `--with`, `-w` Other speaker name(s), comma-separated (enables diarization when multiple)
 - `--mic-only`, `-m` Record microphone only (no system audio)
 - `--multilingual` Use the multilingual model (parakeet-tdt-0.6b-v3)
 - `--model` Choose a model explicitly
@@ -119,7 +123,10 @@ name = "Me"
 #   mlx-community/parakeet-tdt-0.6b-v2  - Fast, English only (default)
 #   mlx-community/parakeet-tdt-0.6b-v3  - Fast, multilingual
 model = "mlx-community/parakeet-tdt-0.6b-v2"
+# diarize = false
 ```
+
+Set `diarize = true` under `[defaults]` to always enable speaker diarization without the `--diarize` flag.
 
 ### Output Patterns
 
@@ -148,6 +155,11 @@ When using system audio capture (the default), livekeet labels speakers by audio
 
 With `--diarize`, livekeet uses speaker embeddings (WeSpeaker ResNet34 via MLX) to identify individual speakers within each channel. This is useful for group calls where multiple remote participants share the system audio channel.
 
+Diarization is enabled automatically when:
+- `--diarize` flag is passed
+- `diarize = true` is set in config
+- Multiple names are given via `--with "Tom,Bob"`
+
 ### Default mode
 
 ```
@@ -155,14 +167,20 @@ Microphone  ────▶  Your name ("Me")
 System Audio ────▶  Other speaker ("Other" or --with name)
 ```
 
-### Diarize mode (`--diarize`)
+### Diarize mode
 
 ```
 Microphone   ────▶  Me, Local 2, Local 3, ...
 System Audio ────▶  Other, Remote 2, Remote 3, ...
 ```
 
-The first speaker on each channel gets the primary name. Additional speakers are labeled automatically. The embedding model (~25MB) is downloaded on first use.
+When using `--with "Tom,Bob,Alice"`, the speakers are named in order:
+
+```
+System Audio ────▶  Tom, Bob, Alice, Remote 4, ...
+```
+
+The first speaker on each channel gets the primary name. Additional speakers use the provided names, then fall back to numbered labels. The embedding model (~25MB) is downloaded on first use.
 
 ### Example Output
 

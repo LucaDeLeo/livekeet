@@ -206,6 +206,7 @@ class SpeakerTracker:
         secondary_prefix: str,
         threshold: float = SIMILARITY_THRESHOLD,
         max_speakers: int = MAX_SPEAKERS,
+        secondary_names: list[str] | None = None,
     ):
         """
         Args:
@@ -215,11 +216,14 @@ class SpeakerTracker:
                 (e.g. "Local" for mic, "Remote" for system).
             threshold: Cosine similarity threshold for matching.
             max_speakers: Maximum number of distinct speakers to track.
+            secondary_names: Explicit names for additional speakers.
+                Used before falling back to "{prefix} N" labels.
         """
         self.primary_name = primary_name
         self.secondary_prefix = secondary_prefix
         self.threshold = threshold
         self.max_speakers = max_speakers
+        self.secondary_names = list(secondary_names) if secondary_names else []
         self.profiles: list[SpeakerProfile] = []
 
     def identify(self, embedding: np.ndarray) -> str:
@@ -270,6 +274,8 @@ class SpeakerTracker:
             speaker_num = len(self.profiles) + 1
             if speaker_num == 1:
                 label = self.primary_name
+            elif self.secondary_names:
+                label = self.secondary_names.pop(0)
             else:
                 label = f"{self.secondary_prefix} {speaker_num}"
             self.profiles.append(SpeakerProfile(
