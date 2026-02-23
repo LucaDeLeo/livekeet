@@ -140,3 +140,10 @@ def test_config_diarize_enables():
     config_diarize = True
     diarize = diarize_flag or config_diarize or len(other_names) > 1
     assert diarize is True
+
+
+def test_diarization_module_importable():
+    """Ensure diarization.py is importable (catches packaging omissions)."""
+    from diarization import SpeakerTracker, load_embedder
+    assert callable(load_embedder)
+    assert callable(SpeakerTracker)

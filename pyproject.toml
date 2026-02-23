@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "livekeet"
-version = "0.1.7"
+version = "0.1.8"
 description = "Real-time audio transcription to markdown using NVIDIA Parakeet via MLX. Optimized for Apple Silicon."
 readme = "README.md"
 license = "MIT"
@@ -23,6 +23,9 @@ dev = [
 
 [project.scripts]
 livekeet = "livekeet:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["livekeet.py", "diarization.py"]
 
 [tool.uv]
 package = true
