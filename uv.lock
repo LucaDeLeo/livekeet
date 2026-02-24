@@ -1057,12 +1057,15 @@ wheels = [
 
 [[package]]
 name = "livekeet"
-version = "0.1.11"
+version = "0.1.12"
 source = { editable = "." }
 dependencies = [
     { name = "numpy" },
     { name = "parakeet-mlx" },
+    { name = "pyannote-audio" },
     { name = "sounddevice" },
+    { name = "torch" },
+    { name = "torchaudio" },
     { name = "webrtcvad-wheels" },
 ]
 
@@ -1070,24 +1073,19 @@ dependencies = [
 dev = [
     { name = "pytest" },
 ]
-pyannote = [
-    { name = "pyannote-audio" },
-    { name = "torch" },
-    { name = "torchaudio" },
-]
 
 [package.metadata]
 requires-dist = [
     { name = "numpy", specifier = "<2.5" },
     { name = "parakeet-mlx", specifier = ">=0.5.1" },
-    { name = "pyannote-audio", marker = "extra == 'pyannote'", specifier = ">=4.0" },
+    { name = "pyannote-audio", specifier = ">=4.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0" },
     { name = "sounddevice", specifier = ">=0.5.5" },
-    { name = "torch", marker = "extra == 'pyannote'", specifier = ">=2.0" },
-    { name = "torchaudio", marker = "extra == 'pyannote'", specifier = ">=2.0" },
+    { name = "torch", specifier = ">=2.0" },
+    { name = "torchaudio", specifier = ">=2.0" },
     { name = "webrtcvad-wheels", specifier = ">=2.0.14" },
 ]
-provides-extras = ["dev", "pyannote"]
+provides-extras = ["dev"]
 
 [[package]]
 name = "llvmlite"
