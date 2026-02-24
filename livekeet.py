@@ -5,7 +5,9 @@ Optimized for Apple Silicon using NVIDIA Parakeet via MLX.
 """
 
 import argparse
+import os
 import re
+import signal
 import stat
 import struct
 import subprocess
@@ -16,7 +18,7 @@ import tomllib
 import urllib.request
 import warnings
 import wave
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Lock, Thread
@@ -193,6 +195,10 @@ name = "Me"
 #   mlx-community/parakeet-tdt-0.6b-v3  - Multilingual, 25 languages
 model = "mlx-community/parakeet-tdt-0.6b-v2"
 # diarize = false
+# engine = "wespeaker"  # or "pyannote" for batch diarization
+
+# [pyannote]
+# token = "hf_..."  # HuggingFace token (or set HF_TOKEN env var)
 """
 
 
@@ -201,7 +207,7 @@ def load_config() -> dict:
     config = {
         "output": {"directory": "", "filename": "{datetime}.md"},
         "speaker": {"name": "Me"},
-        "defaults": {"model": "mlx-community/parakeet-tdt-0.6b-v2", "diarize": False},
+        "defaults": {"model": "mlx-community/parakeet-tdt-0.6b-v2", "diarize": False, "engine": "wespeaker"},
     }
 
     if CONFIG_FILE.exists():
@@ -212,6 +218,10 @@ def load_config() -> dict:
             for section in config:
                 if section in user_config:
                     config[section].update(user_config[section])
+            # Preserve extra sections (e.g. [pyannote])
+            for section in user_config:
+                if section not in config:
+                    config[section] = user_config[section]
         except Exception as e:
             print(f"Warning: Could not load config: {e}", file=sys.stderr)
 
@@ -358,6 +368,8 @@ def warn_flag_interactions(args: argparse.Namespace) -> None:
         print("Warning: --multilingual overrides --model", file=sys.stderr)
     if args.mic_only and args.other_speaker:
         print("Warning: --with is ignored in --mic-only mode (system audio disabled)", file=sys.stderr)
+    if getattr(args, "engine", None) == "pyannote" and not getattr(args, "diarize", False) and not args.other_speaker:
+        print("Note: --engine pyannote implies --diarize", file=sys.stderr)
 
 
 class AudioCaptureProcess:
@@ -481,6 +493,7 @@ class Transcriber:
         system_audio: bool = True,
         status_enabled: bool = False,
         diarize: bool = False,
+        engine: str = "wespeaker",
     ):
         self.output_file = output_file
         self.device = device
@@ -490,6 +503,7 @@ class Transcriber:
         self.system_audio = system_audio
         self.status_enabled = status_enabled
         self.diarize = diarize
+        self.engine = engine
         self.mic_queue: Queue = Queue()
         self.sys_queue: Queue = Queue()
         self.running = False
@@ -507,11 +521,26 @@ class Transcriber:
         self.model = from_pretrained(model_name)
         print("ready")
 
-        # Speaker diarization (optional)
+        # Pyannote engine: in-memory PCM buffers for periodic diarization
+        self._mic_pcm = bytearray()        # raw int16 PCM, append-only
+        self._sys_pcm = bytearray()
+        self._pyannote_turns: list | None = None  # latest diarization result
+        self._diarizer_thread: Thread | None = None
+        self._diarizer_pass = 0
+        self._session_start_str: str = ""
+        self._config: dict = {}
+        self._recording_start: float | None = None
+        self._segments: list[tuple[float, str, str, str]] = []  # (offset, text, channel, timestamp)
+        if engine == "pyannote":
+            from diarization_pyannote import check_pyannote_installed
+            check_pyannote_installed()
+            print("Pyannote engine selected (periodic live diarization)")
+
+        # Speaker diarization — WeSpeaker (real-time, only for wespeaker engine)
         self.embedder = None
         self.mic_tracker = None
         self.sys_tracker = None
-        if diarize:
+        if diarize and engine == "wespeaker":
             from diarization import SpeakerTracker, load_embedder
             print("Loading speaker embeddings...", end=" ", flush=True)
             self.embedder = load_embedder()
@@ -545,8 +574,14 @@ class Transcriber:
             mono = np.mean(indata, axis=1)
         else:
             mono = indata.flatten()
+        mono = mono.astype(np.float32)
         self._last_audio_time = time.monotonic()
-        self.mic_queue.put(mono.astype(np.float32))
+
+        # Save mono audio for pyannote periodic diarization
+        if self.engine == "pyannote":
+            self._mic_pcm.extend((mono * 32767).astype(np.int16).tobytes())
+
+        self.mic_queue.put(mono)
 
     def system_audio_reader(self):
         """Background thread that reads stereo audio from the capture subprocess."""
@@ -557,6 +592,11 @@ class Transcriber:
             if result is not None:
                 mic_audio, system_audio = result
                 self._last_audio_time = time.monotonic()
+
+                # Save per-channel audio for pyannote periodic diarization
+                if self.engine == "pyannote":
+                    self._mic_pcm.extend((mic_audio * 32767).astype(np.int16).tobytes())
+                    self._sys_pcm.extend((system_audio * 32767).astype(np.int16).tobytes())
 
                 # Track system audio presence by RMS energy
                 sys_rms = float(np.sqrt(np.mean(system_audio ** 2)))
@@ -625,15 +665,15 @@ class Transcriber:
         except Exception:
             return False
 
-    def _transcribe_audio(self, audio: np.ndarray) -> str:
-        """Transcribe audio segment."""
+    def _transcribe_audio(self, audio: np.ndarray):
+        """Transcribe audio segment. Returns AlignedResult or None."""
         if len(audio) < SAMPLE_RATE * MIN_SPEECH_DURATION:
-            return ""
+            return None
 
         # Reject near-silent segments (background noise that slipped past VAD)
         rms = np.sqrt(np.mean(audio ** 2))
         if rms < MIN_AUDIO_ENERGY:
-            return ""
+            return None
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             temp_path = f.name
@@ -647,7 +687,9 @@ class Transcriber:
         try:
             with self._model_lock:
                 result = self.model.transcribe(temp_path)
-            return result.text.strip()
+            if not result.text.strip():
+                return None
+            return result
         finally:
             Path(temp_path).unlink(missing_ok=True)
 
@@ -667,7 +709,17 @@ class Transcriber:
 
         speech_audio = np.concatenate(speech_frames)
 
-        if self.diarize and self.embedder is not None:
+        # Estimate when speech started in the recording timeline
+        # (must be computed before transcription delay shifts monotonic clock)
+        speech_offset = None
+        if self.engine == "pyannote" and self._recording_start is not None:
+            speech_duration = len(speech_audio) / SAMPLE_RATE
+            speech_offset = time.monotonic() - self._recording_start - speech_duration
+
+        if self.engine == "pyannote":
+            # Store segment for periodic pyannote relabeling
+            speaker = self._fallback_speaker(channel)
+        elif self.diarize and self.embedder is not None:
             # Mel computation outside lock (CPU-only, ~5ms)
             mel = self.embedder.compute_mel(speech_audio)
             if mel is not None:
@@ -684,12 +736,37 @@ class Transcriber:
             speaker = self._fallback_speaker(channel)
 
         self.state = "transcribing"
-        text = self._transcribe_audio(speech_audio)
+        result = self._transcribe_audio(speech_audio)
         self.state = "listening"
-        if not text:
+        if result is None:
             return
 
-        self._write_transcript(text, speaker=speaker)
+        sentences = result.sentences
+        if not sentences:
+            return
+
+        if speech_offset is not None:
+            # Pyannote path: one segment per sentence with precise audio-aligned offsets
+            base_time = datetime.now() - timedelta(seconds=len(speech_audio) / SAMPLE_RATE)
+            entries = []
+            for sentence in sentences:
+                sent_offset = speech_offset + sentence.start
+                sent_time = base_time + timedelta(seconds=sentence.start)
+                timestamp = sent_time.strftime("%H:%M:%S")
+                entries.append((sent_offset, sentence.text.strip(), timestamp))
+            with self._write_lock:
+                for sent_offset, text, timestamp in entries:
+                    self._segments.append((sent_offset, text, channel, timestamp))
+                self._rebuild_transcript()
+            for _, text, timestamp in entries:
+                print(f"[{timestamp}] {speaker}: {text}")
+            return
+
+        # Non-pyannote path: one line per sentence with real sentence text
+        for sentence in sentences:
+            text = sentence.text.strip()
+            if text:
+                self._write_transcript(text, speaker=speaker)
 
     def channel_worker(self, queue: Queue, channel: str, vad: webrtcvad.Vad):
         """Background thread that runs VAD + transcription for one audio channel."""
@@ -745,16 +822,148 @@ class Transcriber:
                 f.flush()
             print(console)
 
-    def start(self):
-        """Start transcription."""
+    def _resolve_speaker(self, offset: float, channel: str) -> str:
+        """Resolve speaker for a segment using pyannote turns or channel fallback."""
+        if self._pyannote_turns:
+            # Only match turns from the same channel
+            turns = [t for t in self._pyannote_turns if t.channel == channel]
+            # Find turn containing this offset
+            for turn in turns:
+                if turn.start <= offset <= turn.end:
+                    return turn.speaker
+            # Closest turn within 2 seconds
+            best = None
+            best_dist = float("inf")
+            for turn in turns:
+                mid = (turn.start + turn.end) / 2
+                dist = abs(offset - mid)
+                if dist < best_dist:
+                    best_dist = dist
+                    best = turn.speaker
+            if best and best_dist < 2.0:
+                return best
+        return self._fallback_speaker(channel)
+
+    def _rebuild_transcript(self) -> None:
+        """Rewrite the entire .md file from _segments + _pyannote_turns.
+
+        Must be called under _write_lock.
+        """
+        lines = [f"# Transcription - {self._session_start_str}", ""]
+
+        for offset, text, channel, timestamp in self._segments:
+            speaker = self._resolve_speaker(offset, channel)
+            lines.append(f"[{timestamp}] **{speaker}**: {text}")
+
+        self.output_file.write_text("\n".join(lines) + "\n")
+
+    @staticmethod
+    def _pcm_to_temp_wav(pcm_data: bytes) -> Path:
+        """Write raw int16 PCM bytes to a temporary mono WAV file."""
+        path = Path(tempfile.mktemp(suffix=".wav"))
+        with wave.open(str(path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(pcm_data)
+        return path
+
+    def _diarizer_worker(self) -> None:
+        """Background thread: run pyannote periodically on all audio captured so far."""
+        # Wait 30s before first run
+        for _ in range(300):
+            if not self.running:
+                break
+            time.sleep(0.1)
+
+        diarizer = None  # lazy-loaded
+
+        def run_pass(final: bool = False) -> None:
+            nonlocal diarizer
+            audio_seconds = len(self._mic_pcm) / (SAMPLE_RATE * 2)
+            if audio_seconds < 30:
+                return
+
+            if diarizer is None:
+                print("Loading pyannote pipeline...", flush=True)
+                from diarization_pyannote import PyannoteDiarizer
+                token = self._config.get("pyannote", {}).get("token")
+                diarizer = PyannoteDiarizer(hf_token=token)
+
+            if final:
+                print("\nRunning final speaker analysis...", flush=True)
+
+            # Snapshot PCM buffers (append-only, safe under GIL)
+            mic_data = bytes(self._mic_pcm)
+            sys_data = bytes(self._sys_pcm) if self.system_audio else b""
+
+            mic_wav = self._pcm_to_temp_wav(mic_data)
+            sys_wav = self._pcm_to_temp_wav(sys_data) if sys_data else None
+
+            try:
+                if sys_wav:
+                    turns = diarizer.diarize_stereo(
+                        mic_wav, sys_wav,
+                        self.speaker_name, self.other_name, self.other_names,
+                    )
+                else:
+                    turns = diarizer.diarize_mono(mic_wav, self.speaker_name)
+
+                self._diarizer_pass += 1
+                with self._write_lock:
+                    self._pyannote_turns = turns
+                    self._rebuild_transcript()
+
+                print(
+                    f"Speaker labels updated (pass {self._diarizer_pass}, "
+                    f"{len(turns)} turns)",
+                    flush=True,
+                )
+            finally:
+                mic_wav.unlink(missing_ok=True)
+                if sys_wav:
+                    sys_wav.unlink(missing_ok=True)
+
+        while self.running:
+            try:
+                run_pass()
+            except Exception as e:
+                print(f"Diarization error: {e}", file=sys.stderr)
+
+            # Sleep ~2 min between runs
+            for _ in range(1200):
+                if not self.running:
+                    break
+                time.sleep(0.1)
+
+        # Final run after stop
+        try:
+            run_pass(final=True)
+        except Exception as e:
+            print(f"Final diarization failed: {e}", file=sys.stderr)
+
+    def start(self, config: dict | None = None):
+        """Start transcription.
+
+        Args:
+            config: Configuration dict (needed for pyannote token lookup).
+        """
+        self._session_start_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         with open(self.output_file, "w") as f:
-            f.write(f"# Transcription - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            f.write(f"# Transcription - {self._session_start_str}\n\n")
 
         self.running = True
         self.state = "listening"
         self._started_at = time.monotonic()
+        self._recording_start = time.monotonic()
         self._last_audio_time = None
         self._no_audio_warned = False
+
+        # Start periodic diarizer for pyannote engine
+        if self.engine == "pyannote":
+            self._config = config or {}
+            self._diarizer_thread = Thread(target=self._diarizer_worker, daemon=True)
+            self._diarizer_thread.start()
 
         mic_worker = Thread(
             target=self.channel_worker,
@@ -804,19 +1013,28 @@ class Transcriber:
         except KeyboardInterrupt:
             pass
         finally:
+            # Ignore further Ctrl+C during cleanup
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            print("\nStopping...")
             self.stop()
-            if self.system_audio:
+            # Give channel workers time to flush remaining segments
+            time.sleep(2)
+            if self._diarizer_thread is not None:
+                self._diarizer_thread.join(timeout=300)
+            # Write footer
+            with self._write_lock:
+                with open(self.output_file, "a") as f:
+                    f.write(f"\n---\n*Ended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n")
+            print(f"Saved: {self.output_file}")
+            if self.engine != "pyannote" and self.system_audio:
                 relabel_interactive(self.output_file)
 
     def stop(self):
-        """Stop transcription and cleanup."""
+        """Stop transcription and audio capture."""
         self.running = False
         if self.audio_capture:
             self.audio_capture.stop()
             self.audio_capture = None
-        with open(self.output_file, "a") as f:
-            f.write(f"\n---\n*Ended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n")
-        print(f"\nSaved: {self.output_file}")
 
 
 def list_devices():
@@ -892,7 +1110,35 @@ def relabel_interactive(filepath: str | Path) -> None:
         print("\n\nRelabeling cancelled.")
 
 
+def _install_stderr_filter():
+    """Filter macOS MallocStackLogging noise from MLX child processes.
+
+    Redirects fd 2 through a pipe so a background thread can drop lines
+    containing 'MallocStackLogging' before forwarding to real stderr.
+    """
+    real_fd = os.dup(2)
+    r_fd, w_fd = os.pipe()
+    os.dup2(w_fd, 2)
+    os.close(w_fd)
+    sys.stderr = open(2, "w", buffering=1, closefd=False)
+    real_stderr = open(real_fd, "w", buffering=1, closefd=True)
+
+    def _reader():
+        try:
+            with open(r_fd, buffering=1, closefd=True) as pipe:
+                for line in pipe:
+                    if "MallocStackLogging" not in line:
+                        real_stderr.write(line)
+                        real_stderr.flush()
+        except (OSError, ValueError):
+            pass
+
+    Thread(target=_reader, daemon=True).start()
+
+
 def main():
+    _install_stderr_filter()
+
     # Handle subcommands before argparse
     if len(sys.argv) >= 2 and sys.argv[1] == "update":
         run_update()
@@ -980,6 +1226,12 @@ Examples:
         help="Identify individual speakers per audio channel",
     )
     parser.add_argument(
+        "--engine",
+        choices=["wespeaker", "pyannote"],
+        default=None,
+        help="Diarization engine: wespeaker (real-time) or pyannote (batch, post-session)",
+    )
+    parser.add_argument(
         "--status",
         action="store_true",
         help="Show periodic status updates while recording",
@@ -1046,8 +1298,13 @@ Examples:
     # Get speaker names
     speaker_name = config["speaker"]["name"]
 
-    # Diarize if flag, config, or multiple --with names
+    # Resolve engine
+    engine = args.engine or config["defaults"].get("engine", "wespeaker")
+
+    # Diarize if flag, config, multiple --with names, or pyannote engine
     diarize = args.diarize or config["defaults"].get("diarize", False) or len(other_names) > 1
+    if engine == "pyannote":
+        diarize = True
 
     # Get model
     if args.multilingual:
@@ -1066,8 +1323,9 @@ Examples:
         system_audio=system_audio,
         status_enabled=args.status,
         diarize=diarize,
+        engine=engine,
     )
-    transcriber.start()
+    transcriber.start(config=config)
 
 
 if __name__ == "__main__":

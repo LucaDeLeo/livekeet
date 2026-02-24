@@ -147,3 +147,97 @@ def test_diarization_module_importable():
     from diarization import SpeakerTracker, load_embedder
     assert callable(load_embedder)
     assert callable(SpeakerTracker)
+
+
+def test_pcm_to_temp_wav(tmp_path):
+    """_pcm_to_temp_wav produces a valid mono 16kHz WAV."""
+    import wave
+    import numpy as np
+
+    # Generate 1 second of silence as int16 PCM
+    samples = np.zeros(16000, dtype=np.int16)
+    pcm_data = samples.tobytes()
+
+    wav_path = livekeet.Transcriber._pcm_to_temp_wav(pcm_data)
+    try:
+        assert wav_path.exists()
+        with wave.open(str(wav_path), "rb") as wf:
+            assert wf.getnchannels() == 1
+            assert wf.getsampwidth() == 2
+            assert wf.getframerate() == 16000
+            assert wf.getnframes() == 16000
+    finally:
+        wav_path.unlink(missing_ok=True)
+
+
+def _make_transcriber_stub(output_file):
+    """Create a Transcriber-like object with just the fields _rebuild_transcript needs."""
+    t = object.__new__(livekeet.Transcriber)
+    t.output_file = output_file
+    t.speaker_name = "Me"
+    t.other_name = "Alice"
+    t.other_names = ["Alice"]
+    t._session_start_str = "2024-01-02 10:00:00"
+    t._segments = []
+    t._pyannote_turns = None
+    return t
+
+
+def test_rebuild_transcript_fallback(tmp_path):
+    """Segments with no pyannote turns use channel-based fallback labels."""
+    out = tmp_path / "test.md"
+    t = _make_transcriber_stub(out)
+    t._segments = [
+        (5.0, "Hello there", "mic", "10:00:05"),
+        (10.0, "Hi back", "system", "10:00:10"),
+    ]
+
+    t._rebuild_transcript()
+
+    content = out.read_text()
+    assert "**Me**:" in content
+    assert "**Alice**:" in content
+    assert "Hello there" in content
+    assert "Hi back" in content
+    assert content.startswith("# Transcription - 2024-01-02 10:00:00")
+
+
+def test_rebuild_transcript_with_turns(tmp_path):
+    """Segments + mock pyannote turns produce correct pyannote labels."""
+    from types import SimpleNamespace
+
+    out = tmp_path / "test.md"
+    t = _make_transcriber_stub(out)
+    t._segments = [
+        (5.0, "Hello there", "mic", "10:00:05"),
+        (10.0, "Hi back", "system", "10:00:10"),
+    ]
+    t._pyannote_turns = [
+        SimpleNamespace(start=3.0, end=7.0, speaker="Luca", channel="mic"),
+        SimpleNamespace(start=8.0, end=12.0, speaker="Bob", channel="system"),
+    ]
+
+    t._rebuild_transcript()
+
+    content = out.read_text()
+    assert "**Luca**:" in content
+    assert "**Bob**:" in content
+    # Fallback labels should not appear
+    assert "**Me**:" not in content
+    assert "**Alice**:" not in content
+
+
+def test_resolve_speaker_filters_by_channel(tmp_path):
+    """Turns from a different channel should not match — fall back to channel label."""
+    from types import SimpleNamespace
+
+    out = tmp_path / "test.md"
+    t = _make_transcriber_stub(out)
+    # System channel segment, but only mic channel turns exist
+    t._pyannote_turns = [
+        SimpleNamespace(start=3.0, end=7.0, speaker="Luca", channel="mic"),
+    ]
+    # Should fall back to channel label, not match the mic turn
+    assert t._resolve_speaker(5.0, "system") == "Alice"
+    # Same offset on mic channel should match
+    assert t._resolve_speaker(5.0, "mic") == "Luca"
