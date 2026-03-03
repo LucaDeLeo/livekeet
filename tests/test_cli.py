@@ -91,7 +91,7 @@ def test_warn_with_ignored_in_mic_only(capsys):
     args = SimpleNamespace(multilingual=False, model=None, mic_only=True, other_speaker="John")
     livekeet.warn_flag_interactions(args)
     captured = capsys.readouterr()
-    assert "--with is ignored in --mic-only mode" in captured.err
+    assert "--with speaker labels are ignored in --mic-only mode" in captured.err
 
 
 def test_comma_separated_with_names():
