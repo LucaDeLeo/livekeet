@@ -44,10 +44,21 @@ class PyannoteDiarizer:
 
         from pyannote.audio import Pipeline
 
-        self._pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
-            token=token,
-        )
+        try:
+            self._pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                token=token,
+            )
+        except Exception as e:
+            if "403" in str(e):
+                raise RuntimeError(
+                    "Access denied to gated pyannote models. "
+                    "You must accept the user conditions for each model:\n"
+                    "  1. https://huggingface.co/pyannote/speaker-diarization-3.1\n"
+                    "  2. https://huggingface.co/pyannote/segmentation-3.0\n"
+                    "Then retry. Make sure your HF token has the correct permissions."
+                ) from e
+            raise
 
     def _run_pipeline(self, audio_path: Path) -> list[tuple[float, float, str]]:
         """Run pyannote on a mono WAV file.

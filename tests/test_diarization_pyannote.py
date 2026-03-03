@@ -94,6 +94,23 @@ class TestPyannoteDiarizerInit:
             if env_backup is not None:
                 os.environ["HF_TOKEN"] = env_backup
 
+    def test_raises_helpful_message_on_403(self):
+        """A 403 from gated models should show URLs to accept conditions."""
+        mock_pipeline_cls = MagicMock()
+        mock_pipeline_cls.from_pretrained.side_effect = Exception(
+            "403 Client Error: Forbidden"
+        )
+        mock_module = MagicMock()
+        mock_module.Pipeline = mock_pipeline_cls
+
+        with patch.dict("os.environ", {"HF_TOKEN": "hf_test123"}):
+            with patch.dict("sys.modules", {"pyannote.audio": mock_module, "pyannote": MagicMock()}):
+                import importlib
+                import diarization_pyannote
+                importlib.reload(diarization_pyannote)
+                with pytest.raises(RuntimeError, match="Access denied to gated pyannote models"):
+                    diarization_pyannote.PyannoteDiarizer()
+
     def test_uses_env_token(self):
         """Verify HF_TOKEN env var is picked up (pipeline import mocked)."""
         mock_pipeline_cls = MagicMock()
