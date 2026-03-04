@@ -41,6 +41,8 @@ MIN_SPEECH_DURATION = 0.5  # minimum seconds of speech frames to transcribe
 MIN_AUDIO_ENERGY = 0.005  # RMS energy floor to reject near-silent segments
 STATUS_INTERVAL = 10  # seconds between status updates
 NO_AUDIO_WARNING_SECONDS = 10
+SUBPROCESS_MAX_RESTARTS = 5
+SUBPROCESS_RESTART_DELAY = 2.0
 
 # Paths
 DATA_DIR = Path.home() / ".local" / "share" / "livekeet"
@@ -378,8 +380,12 @@ class AudioCaptureProcess:
     Output is stereo: left channel = mic (you), right channel = system (other).
     """
 
-    # Keywords that indicate an error message worth showing
-    ERROR_KEYWORDS = ["error", "failed", "denied", "permission", "not found", "cannot", "unable", "warning", "restart"]
+    # Keywords that indicate a message worth showing to the user
+    SHOW_KEYWORDS = [
+        "error", "failed", "denied", "permission", "not found", "cannot",
+        "unable", "warning", "restart", "mic", "microphone", "started",
+        "output started",
+    ]
 
     def __init__(self, include_mic: bool = True):
         self.include_mic = include_mic
@@ -394,9 +400,8 @@ class AudioCaptureProcess:
             return
         for line in self.process.stderr:
             line_str = line.decode("utf-8", errors="replace").strip()
-            # Only show lines that look like errors
             line_lower = line_str.lower()
-            if any(kw in line_lower for kw in self.ERROR_KEYWORDS):
+            if any(kw in line_lower for kw in self.SHOW_KEYWORDS):
                 print(f"[audio] {line_str}", file=sys.stderr)
 
     def start(self) -> None:
@@ -461,6 +466,21 @@ class AudioCaptureProcess:
         except Exception:
             return None
 
+    def is_alive(self) -> bool:
+        """Check if the subprocess is still running."""
+        return self.process is not None and self.process.poll() is None
+
+    def restart(self) -> bool:
+        """Restart the audio capture subprocess."""
+        self.stop()
+        time.sleep(SUBPROCESS_RESTART_DELAY)
+        try:
+            self.start()
+            return True
+        except Exception as e:
+            print(f"[audio] Restart failed: {e}", file=sys.stderr)
+            return False
+
     def stop(self) -> None:
         """Stop the audio capture subprocess."""
         self.running = False
@@ -472,6 +492,52 @@ class AudioCaptureProcess:
             except subprocess.TimeoutExpired:
                 self.process.kill()
             self.process = None
+
+
+class AppendableWav:
+    """Append-only WAV file for incremental PCM storage on disk."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._data_bytes_written = 0
+        self._f = open(path, "wb")
+        # Write 44-byte WAV header (mono, 16-bit, 16kHz)
+        self._f.write(struct.pack(
+            '<4sI4s4sIHHIIHH4sI',
+            b'RIFF', 36,           # RIFF header, size placeholder
+            b'WAVE',
+            b'fmt ', 16,           # fmt chunk
+            1,                     # PCM format
+            1,                     # mono
+            SAMPLE_RATE,           # sample rate
+            SAMPLE_RATE * 2,       # byte rate
+            2,                     # block align
+            16,                    # bits per sample
+            b'data', 0,            # data chunk, size placeholder
+        ))
+        self._f.flush()
+
+    def append(self, pcm_bytes: bytes) -> None:
+        n = len(pcm_bytes)
+        if n == 0:
+            return
+        self._f.seek(0, 2)  # seek to end
+        self._f.write(pcm_bytes)
+        self._data_bytes_written += n
+        # Patch RIFF size (offset 4) and data size (offset 40)
+        self._f.seek(4)
+        self._f.write(struct.pack('<I', 36 + self._data_bytes_written))
+        self._f.seek(40)
+        self._f.write(struct.pack('<I', self._data_bytes_written))
+        self._f.flush()
+
+    @property
+    def audio_seconds(self) -> float:
+        return self._data_bytes_written / (SAMPLE_RATE * 2)
+
+    def cleanup(self) -> None:
+        self._f.close()
+        self.path.unlink(missing_ok=True)
 
 
 class Transcriber:
@@ -514,6 +580,8 @@ class Transcriber:
         self._no_audio_warned = False
         self._last_system_audio_time: float | None = None
         self._system_audio_warned = False
+        self._last_mic_audio_time: float | None = None
+        self._mic_audio_warned = False
 
         short_name = model_name.split("/")[-1] if "/" in model_name else model_name
         print(f"Loading {short_name}...", end=" ", flush=True)
@@ -521,9 +589,15 @@ class Transcriber:
         self.model = from_pretrained(model_name)
         print("ready")
 
-        # Pyannote engine: in-memory PCM buffers for periodic diarization
-        self._mic_pcm = bytearray()        # raw int16 PCM, append-only
-        self._sys_pcm = bytearray()
+        # Pyannote engine: disk-backed WAV files for periodic diarization
+        self._pcm_dir: tempfile.TemporaryDirectory | None = None
+        self._mic_wav: AppendableWav | None = None
+        self._sys_wav: AppendableWav | None = None
+        if engine == "pyannote":
+            self._pcm_dir = tempfile.TemporaryDirectory(prefix="livekeet_pcm_")
+            pcm_path = Path(self._pcm_dir.name)
+            self._mic_wav = AppendableWav(pcm_path / "mic.wav")
+            self._sys_wav = AppendableWav(pcm_path / "sys.wav")
         self._pyannote_turns: list | None = None  # latest diarization result
         self._diarizer_thread: Thread | None = None
         self._diarizer_pass = 0
@@ -579,7 +653,7 @@ class Transcriber:
 
         # Save mono audio for pyannote periodic diarization
         if self.engine == "pyannote":
-            self._mic_pcm.extend((mono * 32767).astype(np.int16).tobytes())
+            self._mic_wav.append((mono * 32767).astype(np.int16).tobytes())
 
         self.mic_queue.put(mono)
 
@@ -587,16 +661,18 @@ class Transcriber:
         """Background thread that reads stereo audio from the capture subprocess."""
         chunk_samples = 1024
         max_queue_size = 200
+        restart_count = 0
         while self.running and self.audio_capture:
             result = self.audio_capture.read_chunk(chunk_samples)
             if result is not None:
+                restart_count = 0
                 mic_audio, system_audio = result
                 self._last_audio_time = time.monotonic()
 
                 # Save per-channel audio for pyannote periodic diarization
                 if self.engine == "pyannote":
-                    self._mic_pcm.extend((mic_audio * 32767).astype(np.int16).tobytes())
-                    self._sys_pcm.extend((system_audio * 32767).astype(np.int16).tobytes())
+                    self._mic_wav.append((mic_audio * 32767).astype(np.int16).tobytes())
+                    self._sys_wav.append((system_audio * 32767).astype(np.int16).tobytes())
 
                 # Track system audio presence by RMS energy
                 sys_rms = float(np.sqrt(np.mean(system_audio ** 2)))
@@ -606,6 +682,14 @@ class Transcriber:
                         print("System audio recovered", file=sys.stderr)
                         self._system_audio_warned = False
 
+                # Track mic audio presence by RMS energy
+                mic_rms = float(np.sqrt(np.mean(mic_audio ** 2)))
+                if mic_rms > 0.001:
+                    self._last_mic_audio_time = time.monotonic()
+                    if self._mic_audio_warned:
+                        print("Mic audio recovered", file=sys.stderr)
+                        self._mic_audio_warned = False
+
                 for q, chunk in ((self.mic_queue, mic_audio), (self.sys_queue, system_audio)):
                     while q.qsize() > max_queue_size:
                         try:
@@ -613,6 +697,28 @@ class Transcriber:
                         except Empty:
                             break
                     q.put(chunk)
+            else:
+                # read_chunk returned None - check if subprocess died
+                if self.audio_capture and not self.audio_capture.is_alive():
+                    restart_count += 1
+                    if restart_count > SUBPROCESS_MAX_RESTARTS:
+                        print(
+                            f"Audio capture: max restarts ({SUBPROCESS_MAX_RESTARTS}) exceeded, stopping",
+                            file=sys.stderr,
+                        )
+                        break
+                    print(
+                        f"Audio capture died, restarting ({restart_count}/{SUBPROCESS_MAX_RESTARTS})...",
+                        file=sys.stderr,
+                    )
+                    if self.audio_capture.restart():
+                        continue
+                    else:
+                        break
+                else:
+                    # Process alive but pipe returned None - unexpected error
+                    print("Audio capture pipe error, stopping", file=sys.stderr)
+                    break
 
     def _status_worker(self):
         """Periodic status updates and no-audio warnings."""
@@ -653,6 +759,41 @@ class Transcriber:
                 self._system_audio_warned = True
                 print(
                     "System audio lost. Stream may have stalled — waiting for recovery.",
+                    file=sys.stderr,
+                )
+
+            # Detect mic audio not working (system audio works but mic doesn't)
+            if (
+                self.system_audio
+                and not self._mic_audio_warned
+                and self._started_at is not None
+                and now - self._started_at >= NO_AUDIO_WARNING_SECONDS
+                and self._last_mic_audio_time is None
+            ):
+                self._mic_audio_warned = True
+                print(
+                    "Mic audio not detected. Your speech won't be transcribed.",
+                    file=sys.stderr,
+                )
+                print(
+                    "  Fix: System Settings → Privacy & Security → Microphone → enable for your terminal app",
+                    file=sys.stderr,
+                )
+                print(
+                    "  Or try: --mic-only (uses sounddevice instead of audiocapture)",
+                    file=sys.stderr,
+                )
+
+            # Detect mic audio going silent mid-session
+            if (
+                self.system_audio
+                and not self._mic_audio_warned
+                and self._last_mic_audio_time is not None
+                and now - self._last_mic_audio_time > NO_AUDIO_WARNING_SECONDS * 3
+            ):
+                self._mic_audio_warned = True
+                print(
+                    "Mic audio lost — your speech is no longer being captured.",
                     file=sys.stderr,
                 )
 
@@ -857,17 +998,6 @@ class Transcriber:
 
         self.output_file.write_text("\n".join(lines) + "\n")
 
-    @staticmethod
-    def _pcm_to_temp_wav(pcm_data: bytes) -> Path:
-        """Write raw int16 PCM bytes to a temporary mono WAV file."""
-        path = Path(tempfile.mktemp(suffix=".wav"))
-        with wave.open(str(path), "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(SAMPLE_RATE)
-            wf.writeframes(pcm_data)
-        return path
-
     def _diarizer_worker(self) -> None:
         """Background thread: run pyannote periodically on all audio captured so far."""
         # Wait 30s before first run
@@ -880,7 +1010,7 @@ class Transcriber:
 
         def run_pass(final: bool = False) -> None:
             nonlocal diarizer
-            audio_seconds = len(self._mic_pcm) / (SAMPLE_RATE * 2)
+            audio_seconds = self._mic_wav.audio_seconds
             if audio_seconds < 30:
                 return
 
@@ -893,36 +1023,27 @@ class Transcriber:
             if final:
                 print("\nRunning final speaker analysis...", flush=True)
 
-            # Snapshot PCM buffers (append-only, safe under GIL)
-            mic_data = bytes(self._mic_pcm)
-            sys_data = bytes(self._sys_pcm) if self.system_audio else b""
+            # Use persistent WAV files directly — no memory copy needed
+            sys_wav = self._sys_wav.path if self.system_audio else None
 
-            mic_wav = self._pcm_to_temp_wav(mic_data)
-            sys_wav = self._pcm_to_temp_wav(sys_data) if sys_data else None
-
-            try:
-                if sys_wav:
-                    turns = diarizer.diarize_stereo(
-                        mic_wav, sys_wav,
-                        self.speaker_name, self.other_name, self.other_names,
-                    )
-                else:
-                    turns = diarizer.diarize_mono(mic_wav, self.speaker_name)
-
-                self._diarizer_pass += 1
-                with self._write_lock:
-                    self._pyannote_turns = turns
-                    self._rebuild_transcript()
-
-                print(
-                    f"Speaker labels updated (pass {self._diarizer_pass}, "
-                    f"{len(turns)} turns)",
-                    flush=True,
+            if sys_wav:
+                turns = diarizer.diarize_stereo(
+                    self._mic_wav.path, sys_wav,
+                    self.speaker_name, self.other_name, self.other_names,
                 )
-            finally:
-                mic_wav.unlink(missing_ok=True)
-                if sys_wav:
-                    sys_wav.unlink(missing_ok=True)
+            else:
+                turns = diarizer.diarize_mono(self._mic_wav.path, self.speaker_name)
+
+            self._diarizer_pass += 1
+            with self._write_lock:
+                self._pyannote_turns = turns
+                self._rebuild_transcript()
+
+            print(
+                f"Speaker labels updated (pass {self._diarizer_pass}, "
+                f"{len(turns)} turns)",
+                flush=True,
+            )
 
         while self.running:
             try:
@@ -1021,6 +1142,12 @@ class Transcriber:
             time.sleep(2)
             if self._diarizer_thread is not None:
                 self._diarizer_thread.join(timeout=300)
+            if self._pcm_dir is not None:
+                if self._mic_wav:
+                    self._mic_wav.cleanup()
+                if self._sys_wav:
+                    self._sys_wav.cleanup()
+                self._pcm_dir.cleanup()
             # Write footer
             with self._write_lock:
                 with open(self.output_file, "a") as f:
