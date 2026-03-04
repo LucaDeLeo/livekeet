@@ -699,6 +699,12 @@ class Transcriber:
                     q.put(chunk)
             else:
                 # read_chunk returned None - check if subprocess died
+                if not self.running:
+                    break  # Graceful shutdown (e.g. Ctrl+C)
+                # Brief pause to let main thread handle KeyboardInterrupt
+                time.sleep(0.1)
+                if not self.running:
+                    break
                 if self.audio_capture and not self.audio_capture.is_alive():
                     restart_count += 1
                     if restart_count > SUBPROCESS_MAX_RESTARTS:
