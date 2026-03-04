@@ -9,7 +9,7 @@ import ScreenCaptureKit
 
 let targetSampleRate: Double = 16000
 let outputFrameSize = 1024  // ~64ms at 16kHz - larger frames = more timing tolerance
-let ringBufferCapacity = Int(targetSampleRate * 2)  // 2 seconds of audio
+let ringBufferCapacity = 32768  // Power-of-2 for bitmask wrapping (~2s at 16kHz)
 let minBufferSamples = Int(targetSampleRate * 0.2)  // 200ms pre-buffer before starting output
 let outputChannels = 2  // Stereo: left=mic, right=system (for speaker detection)
 
@@ -32,6 +32,7 @@ extension CMSampleBuffer {
 final class RingBuffer: @unchecked Sendable {
     private let buffer: UnsafeMutablePointer<Float>
     private let capacity: Int
+    private let mask: Int
     private var writeIndex: Int = 0
     private var readIndex: Int = 0
     private var availableCount: Int = 0
@@ -39,7 +40,9 @@ final class RingBuffer: @unchecked Sendable {
     private var underrunCount: Int = 0
 
     init(capacity: Int) {
+        precondition(capacity & (capacity - 1) == 0, "Ring buffer capacity must be a power of 2")
         self.capacity = capacity
+        self.mask = capacity - 1
         self.buffer = .allocate(capacity: capacity)
         self.buffer.initialize(repeating: 0, count: capacity)
     }
@@ -58,15 +61,17 @@ final class RingBuffer: @unchecked Sendable {
         let overflow = (availableCount + toWrite) - capacity
         if overflow > 0 {
             // Advance read pointer to make room
-            readIndex = (readIndex + overflow) % capacity
+            readIndex = (readIndex + overflow) & mask
             availableCount -= overflow
         }
 
-        // Write samples with wraparound
-        for i in 0..<toWrite {
-            buffer[(writeIndex + i) % capacity] = samples[i]
+        // Write samples with memcpy (two-part for wraparound)
+        let firstPart = min(toWrite, capacity - writeIndex)
+        buffer.advanced(by: writeIndex).update(from: samples, count: firstPart)
+        if firstPart < toWrite {
+            buffer.update(from: samples.advanced(by: firstPart), count: toWrite - firstPart)
         }
-        writeIndex = (writeIndex + toWrite) % capacity
+        writeIndex = (writeIndex + toWrite) & mask
         availableCount += toWrite
     }
 
@@ -89,7 +94,7 @@ final class RingBuffer: @unchecked Sendable {
 
         // Convert float samples to Int16 with clipping
         for i in 0..<toRead {
-            let sample = buffer[(readIndex + i) % capacity]
+            let sample = buffer[(readIndex + i) & mask]
             let clamped = max(-1.0, min(1.0, sample))
             output[i] = Int16(clamped * 32767)
         }
@@ -104,7 +109,7 @@ final class RingBuffer: @unchecked Sendable {
             }
         }
 
-        readIndex = (readIndex + toRead) % capacity
+        readIndex = (readIndex + toRead) & mask
         availableCount -= toRead
         return toRead
     }
@@ -116,8 +121,11 @@ final class RingBuffer: @unchecked Sendable {
 
         let toRead = min(count, availableCount)
 
-        for i in 0..<toRead {
-            output[i] = buffer[(readIndex + i) % capacity]
+        // Read with memcpy (two-part for wraparound)
+        let firstPart = min(toRead, capacity - readIndex)
+        output.update(from: buffer.advanced(by: readIndex), count: firstPart)
+        if firstPart < toRead {
+            output.advanced(by: firstPart).update(from: buffer, count: toRead - firstPart)
         }
 
         // Fill remainder with silence if underrun
@@ -130,7 +138,7 @@ final class RingBuffer: @unchecked Sendable {
             }
         }
 
-        readIndex = (readIndex + toRead) % capacity
+        readIndex = (readIndex + toRead) & mask
         availableCount -= toRead
         return toRead
     }
@@ -161,6 +169,8 @@ final class AudioCaptureManager: @unchecked Sendable {
     let systemBuffer = RingBuffer(capacity: ringBufferCapacity)
     let micBuffer = RingBuffer(capacity: ringBufferCapacity)
     private let outputQueue = DispatchQueue(label: "audiocapture.output", qos: .userInteractive)
+    private let audioSampleQueue = DispatchQueue(label: "audiocapture.sck-audio", qos: .userInteractive)
+    private let screenDropQueue = DispatchQueue(label: "audiocapture.screen-drop", qos: .background)
 
     private var systemAudioConverter: AVAudioConverter?
     private let outputFormat: AVAudioFormat
@@ -174,13 +184,19 @@ final class AudioCaptureManager: @unchecked Sendable {
     // System audio health tracking
     private var systemAudioFrameCount: UInt64 = 0
 
+    // PTS gap detection (accessed only on serial audioSampleQueue)
+    private var lastSystemPTS: CMTime = .invalid
+    private var lastSystemDuration: CMTime = .invalid
+
     // Stream restart state (protected by restartState lock)
     private struct RestartState {
         var count = 0
         var isRestarting = false
         var lastTime: Date?
+        var lastAttemptTime: Date?
     }
-    private let maxRestarts = 3
+    private let maxRestarts = 20
+    private let minRestartInterval: TimeInterval = 3
     private let restartState = OSAllocatedUnfairLock(initialState: RestartState())
 
     init() {
@@ -245,7 +261,8 @@ final class AudioCaptureManager: @unchecked Sendable {
 
         outputHandler = StreamOutputHandler(manager: self)
         stream = SCStream(filter: filter, configuration: config, delegate: outputHandler)
-        try stream?.addStreamOutput(outputHandler!, type: .audio, sampleHandlerQueue: .global(qos: .userInteractive))
+        try stream?.addStreamOutput(outputHandler!, type: .audio, sampleHandlerQueue: audioSampleQueue)
+        try stream?.addStreamOutput(outputHandler!, type: .screen, sampleHandlerQueue: screenDropQueue)
 
         if includeMic { try startMicrophoneCapture() }
 
@@ -306,6 +323,23 @@ final class AudioCaptureManager: @unchecked Sendable {
     func processSystemAudio(_ sampleBuffer: CMSampleBuffer) {
         guard let pcmBuffer = sampleBuffer.asPCMBuffer else { return }
 
+        // Track PTS for gap detection (thread-safe: runs on serial audioSampleQueue)
+        let currentPTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let currentDuration = CMSampleBufferGetDuration(sampleBuffer)
+        if lastSystemPTS.isValid && currentPTS.isValid {
+            let expectedPTS = CMTimeAdd(lastSystemPTS, lastSystemDuration)
+            let gap = CMTimeSubtract(currentPTS, expectedPTS)
+            let gapSeconds = CMTimeGetSeconds(gap)
+            if gapSeconds > 1.0 {
+                fputs("Warning: system audio gap (\(String(format: "%.0f", gapSeconds * 1000))ms), restarting stream\n", stderr)
+                restartCapture()
+            } else if gapSeconds > 0.2 {
+                fputs("Warning: system audio gap (\(String(format: "%.0f", gapSeconds * 1000))ms)\n", stderr)
+            }
+        }
+        lastSystemPTS = currentPTS
+        lastSystemDuration = currentDuration
+
         os_unfair_lock_lock(&converterLock)
 
         // Detect format changes (e.g. audio routing switch) and recreate converter
@@ -333,10 +367,10 @@ final class AudioCaptureManager: @unchecked Sendable {
         systemBuffer.write(samples)
         systemAudioFrameCount += 1
 
-        // Reset restart counter after 60s of stable audio
+        // Reset restart counter after 30s of stable audio
         restartState.withLock { state in
             if let lastRestart = state.lastTime,
-               Date().timeIntervalSince(lastRestart) > 60 {
+               Date().timeIntervalSince(lastRestart) > 30 {
                 state.count = 0
                 state.lastTime = nil
             }
@@ -347,6 +381,8 @@ final class AudioCaptureManager: @unchecked Sendable {
         os_unfair_lock_lock(&converterLock)
         systemAudioConverter = nil
         os_unfair_lock_unlock(&converterLock)
+        lastSystemPTS = .invalid
+        lastSystemDuration = .invalid
     }
 
     // MARK: - Microphone Capture
@@ -393,9 +429,16 @@ final class AudioCaptureManager: @unchecked Sendable {
         // Stereo output: 2 channels interleaved [L0, R0, L1, R1, ...]
         let stereoFrameCount = outputFrameSize * outputChannels
         let outputBuffer = UnsafeMutablePointer<Int16>.allocate(capacity: stereoFrameCount)
+        // vDSP intermediate buffers for vectorized float-to-int16 conversion
+        let interleavedFloats = UnsafeMutablePointer<Float>.allocate(capacity: stereoFrameCount)
+        let clippedFloats = UnsafeMutablePointer<Float>.allocate(capacity: stereoFrameCount)
+        let scaledFloats = UnsafeMutablePointer<Float>.allocate(capacity: stereoFrameCount)
         systemFloats.initialize(repeating: 0, count: outputFrameSize)
         micFloats.initialize(repeating: 0, count: outputFrameSize)
         outputBuffer.initialize(repeating: 0, count: stereoFrameCount)
+        interleavedFloats.initialize(repeating: 0, count: stereoFrameCount)
+        clippedFloats.initialize(repeating: 0, count: stereoFrameCount)
+        scaledFloats.initialize(repeating: 0, count: stereoFrameCount)
 
         setvbuf(stdout, nil, _IONBF, 0)
 
@@ -414,10 +457,11 @@ final class AudioCaptureManager: @unchecked Sendable {
         var lastUnderrunReport = 0
         var lastWatchdogFrameCount: UInt64 = 0
         var watchdogStaleTicks = 0
-        let watchdogThresholdTicks = 78  // ~5s at 64ms intervals
+        let watchdogThresholdTicks = 16  // ~1s at 64ms intervals
         weak let weakSelf = self
 
-        timer.setEventHandler { [systemBuffer, micBuffer, systemFloats, micFloats, outputBuffer] in
+        timer.setEventHandler { [systemBuffer, micBuffer, systemFloats, micFloats, outputBuffer,
+                                  interleavedFloats, clippedFloats, scaledFloats] in
             guard let strongSelf = weakSelf, strongSelf.isRunning else { return }
 
             let sysAvailable = systemBuffer.available
@@ -448,17 +492,19 @@ final class AudioCaptureManager: @unchecked Sendable {
                 _ = micBuffer.readFloat(into: micFloats, count: outputFrameSize)
             }
 
-            // Output stereo: left channel = mic, right channel = system
+            // Interleave mic/system into float buffer
             for i in 0..<outputFrameSize {
-                // Left channel (mic)
-                let micSample = includeMic ? micFloats[i] : 0
-                let micClamped = max(-1.0, min(1.0, micSample))
-                outputBuffer[i * 2] = Int16(micClamped * 32767)
-
-                // Right channel (system)
-                let sysClamped = max(-1.0, min(1.0, systemFloats[i]))
-                outputBuffer[i * 2 + 1] = Int16(sysClamped * 32767)
+                interleavedFloats[i * 2] = includeMic ? micFloats[i] : 0
+                interleavedFloats[i * 2 + 1] = systemFloats[i]
             }
+
+            // vDSP: clamp [-1,1], scale by 32767, convert to Int16
+            var low: Float = -1.0
+            var high: Float = 1.0
+            vDSP_vclip(interleavedFloats, 1, &low, &high, clippedFloats, 1, vDSP_Length(stereoFrameCount))
+            var scale: Float = 32767.0
+            vDSP_vsmul(clippedFloats, 1, &scale, scaledFloats, 1, vDSP_Length(stereoFrameCount))
+            vDSP_vfix16(scaledFloats, 1, outputBuffer, 1, vDSP_Length(stereoFrameCount))
 
             // Write stereo to stdout
             let bytesToWrite = stereoFrameCount * MemoryLayout<Int16>.size
@@ -483,6 +529,9 @@ final class AudioCaptureManager: @unchecked Sendable {
             systemFloats.deallocate()
             micFloats.deallocate()
             outputBuffer.deallocate()
+            interleavedFloats.deallocate()
+            clippedFloats.deallocate()
+            scaledFloats.deallocate()
         }
 
         self.outputTimer = timer
@@ -499,8 +548,14 @@ final class AudioCaptureManager: @unchecked Sendable {
         // Atomically check-and-set restart state
         let attempt: (num: Int, max: Int)? = restartState.withLock { state in
             guard !state.isRestarting, state.count < maxRestarts else { return nil }
+            // Rate limit: skip if last attempt was too recent
+            if let lastAttempt = state.lastAttemptTime,
+               Date().timeIntervalSince(lastAttempt) < minRestartInterval {
+                return nil
+            }
             state.isRestarting = true
             state.count += 1
+            state.lastAttemptTime = Date()
             return (state.count, maxRestarts)
         }
 
@@ -512,7 +567,7 @@ final class AudioCaptureManager: @unchecked Sendable {
         }
         defer { restartState.withLock { $0.isRestarting = false } }
 
-        let backoff = pow(2.0, Double(attempt.num - 1))  // 1s, 2s, 4s
+        let backoff = min(0.25 * pow(2.0, Double(attempt.num - 1)), 10.0)  // 0.25s, 0.5s, 1s, 2s, ... capped at 10s
         fputs("Stream restart: attempt \(attempt.num)/\(attempt.max) (backoff \(Int(backoff))s)\n", stderr)
         try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
 
@@ -533,7 +588,8 @@ final class AudioCaptureManager: @unchecked Sendable {
 
             outputHandler = StreamOutputHandler(manager: self)
             stream = SCStream(filter: filter, configuration: config, delegate: outputHandler)
-            try stream?.addStreamOutput(outputHandler!, type: .audio, sampleHandlerQueue: .global(qos: .userInteractive))
+            try stream?.addStreamOutput(outputHandler!, type: .audio, sampleHandlerQueue: audioSampleQueue)
+            try stream?.addStreamOutput(outputHandler!, type: .screen, sampleHandlerQueue: screenDropQueue)
 
             try await stream?.startCapture()
             restartState.withLock { $0.lastTime = Date() }
@@ -572,7 +628,10 @@ final class StreamOutputHandler: NSObject, SCStreamOutput, SCStreamDelegate, @un
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        fputs("Stream error: \(error.localizedDescription)\n", stderr)
+        let nsError = error as NSError
+        fputs("Stream error: [\(nsError.domain) \(nsError.code)] \(nsError.localizedDescription)\n", stderr)
+        // -3808 = attemptToStopStreamState (intentional stop), don't restart
+        if nsError.code == -3808 { return }
         manager?.restartCapture()
     }
 }
