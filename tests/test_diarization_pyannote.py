@@ -94,23 +94,41 @@ class TestPyannoteDiarizerInit:
             if env_backup is not None:
                 os.environ["HF_TOKEN"] = env_backup
 
+    @staticmethod
+    def _patched_pipeline(side_effect=None):
+        """Patch pyannote.audio with a mock Pipeline and reload the module."""
+        from contextlib import contextmanager
+
+        @contextmanager
+        def ctx():
+            mock_pipeline_cls = MagicMock()
+            if side_effect:
+                mock_pipeline_cls.from_pretrained.side_effect = side_effect
+            else:
+                mock_pipeline_cls.from_pretrained.return_value = MagicMock()
+            mock_module = MagicMock()
+            mock_module.Pipeline = mock_pipeline_cls
+
+            with patch.dict("os.environ", {"HF_TOKEN": "hf_test123"}):
+                with patch.dict("sys.modules", {"pyannote.audio": mock_module, "pyannote": MagicMock()}):
+                    import importlib
+                    import diarization_pyannote
+                    importlib.reload(diarization_pyannote)
+                    yield diarization_pyannote, mock_pipeline_cls
+
+        return ctx()
+
+    def test_raises_helpful_message_on_403(self):
+        """A 403 from gated models should show URLs to accept conditions."""
+        with self._patched_pipeline(side_effect=Exception("403 Client Error: Forbidden")) as (mod, _):
+            with pytest.raises(RuntimeError, match="Access denied to gated pyannote models"):
+                mod.PyannoteDiarizer()
+
     def test_uses_env_token(self):
         """Verify HF_TOKEN env var is picked up (pipeline import mocked)."""
-        mock_pipeline_cls = MagicMock()
-        mock_pipeline_cls.from_pretrained.return_value = MagicMock()
-        mock_module = MagicMock()
-        mock_module.Pipeline = mock_pipeline_cls
-
-        with patch.dict("os.environ", {"HF_TOKEN": "hf_test123"}):
-            with patch.dict("sys.modules", {"pyannote.audio": mock_module, "pyannote": MagicMock()}):
-                import importlib
-                import diarization_pyannote
-                importlib.reload(diarization_pyannote)
-                try:
-                    diarizer = diarization_pyannote.PyannoteDiarizer()
-                    mock_pipeline_cls.from_pretrained.assert_called_once()
-                except Exception:
-                    pass
+        with self._patched_pipeline() as (mod, mock_cls):
+            mod.PyannoteDiarizer()
+            mock_cls.from_pretrained.assert_called_once()
 
 
 # --- check_pyannote_installed ---
