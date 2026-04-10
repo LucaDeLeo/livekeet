@@ -183,8 +183,9 @@ DEFAULT_CONFIG = """\
 [output]
 # Directory for transcripts (empty = current directory)
 directory = ""
-# Filename pattern: {date}, {time}, {datetime}, or any static name
-# Examples: "{datetime}.md", "{date}-meeting.md", "transcript.md"
+# Filename pattern: {date}, {time}, {datetime}, {names}, or any static name
+# {names} expands to --with/-w names joined by dashes (e.g., John-Paul)
+# Examples: "{datetime}.md", "{datetime}-{names}.md", "{date}-meeting.md"
 filename = "{datetime}.md"
 
 [speaker]
@@ -253,20 +254,38 @@ Models (downloaded on first use):
   parakeet-tdt-0.6b-v3  Multilingual, 25 languages (--multilingual)""")
 
 
-def resolve_output_path(config: dict, output_arg: str | None) -> Path:
+def _expand_filename(pattern: str, names: list[str]) -> str:
+    """Expand a filename pattern with datetime and names variables."""
+    now = datetime.now()
+    # Sanitize names: strip path separators so Path().stem can't truncate
+    safe_names = [n.replace("/", "_").replace("\\", "_") for n in names]
+    names_str = "-".join(safe_names)
+    filename = pattern.format(
+        date=now.strftime("%Y-%m-%d"),
+        time=now.strftime("%H-%M-%S"),
+        datetime=now.strftime("%Y-%m-%d-%H%M%S"),
+        names=names_str,
+    )
+    # Clean up stray dashes from empty {names} (e.g., "2024-01-15-143025-.md")
+    base = filename.rsplit(".", 1)
+    stem = base[0]
+    suffix = f".{base[1]}" if len(base) > 1 else ""
+    stem = re.sub(r"-{2,}", "-", stem)  # collapse multiple dashes
+    stem = stem.strip("-")  # strip leading/trailing dashes
+    return stem + suffix
+
+
+def resolve_output_path(config: dict, output_arg: str | None, names: list[str] | None = None) -> Path:
     """Resolve the output file path from config and CLI args."""
+    if names is None:
+        names = []
     if output_arg:
         # CLI argument takes precedence
         path = Path(output_arg)
         if path.is_dir():
             # Use config filename pattern inside the given directory
-            now = datetime.now()
             pattern = config["output"]["filename"]
-            filename = pattern.format(
-                date=now.strftime("%Y-%m-%d"),
-                time=now.strftime("%H-%M-%S"),
-                datetime=now.strftime("%Y-%m-%d-%H%M%S"),
-            )
+            filename = _expand_filename(pattern, names)
             return path / filename
         if not path.suffix:
             path = path.with_suffix(".md")
@@ -277,12 +296,7 @@ def resolve_output_path(config: dict, output_arg: str | None) -> Path:
     directory = config["output"]["directory"]
 
     # Expand pattern
-    now = datetime.now()
-    filename = pattern.format(
-        date=now.strftime("%Y-%m-%d"),
-        time=now.strftime("%H-%M-%S"),
-        datetime=now.strftime("%Y-%m-%d-%H%M%S"),
-    )
+    filename = _expand_filename(pattern, names)
 
     if directory:
         base_dir = Path(directory).expanduser()
@@ -369,7 +383,7 @@ def warn_flag_interactions(args: argparse.Namespace) -> None:
     if args.multilingual and args.model:
         print("Warning: --multilingual overrides --model", file=sys.stderr)
     if args.mic_only and args.other_speaker:
-        print("Warning: --with is ignored in --mic-only mode (system audio disabled)", file=sys.stderr)
+        print("Warning: --with speaker labels are ignored in --mic-only mode (system audio disabled), but still affect the output filename", file=sys.stderr)
     if getattr(args, "engine", None) == "pyannote" and not getattr(args, "diarize", False) and not args.other_speaker:
         print("Note: --engine pyannote implies --diarize", file=sys.stderr)
 
@@ -1408,8 +1422,15 @@ Examples:
                 print("Or use --mic-only to capture microphone only")
                 sys.exit(1)
 
+    # Parse comma-separated speaker names (needed for output filename)
+    if args.other_speaker:
+        other_names = [n.strip() for n in args.other_speaker.split(",") if n.strip()]
+    else:
+        other_names = []
+    other_name = other_names[0] if other_names else "Other"
+
     # Resolve output path
-    output_path = resolve_output_path(config, args.output)
+    output_path = resolve_output_path(config, args.output, other_names)
     output_path, suffixed = ensure_unique_path(output_path)
     if suffixed:
         print(f"Output exists; saving to {output_path}")
@@ -1420,13 +1441,6 @@ Examples:
         device, device_name = resolve_device(args.device)
         if device_name:
             print(f"Using input device: {device_name}")
-
-    # Parse comma-separated speaker names
-    if args.other_speaker:
-        other_names = [n.strip() for n in args.other_speaker.split(",") if n.strip()]
-    else:
-        other_names = []
-    other_name = other_names[0] if other_names else "Other"
 
     # Get speaker names
     speaker_name = config["speaker"]["name"]
