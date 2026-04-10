@@ -256,7 +256,7 @@ def _expand_filename(pattern: str, names: list[str]) -> str:
     """Expand a filename pattern with datetime and names variables."""
     now = datetime.now()
     # Sanitize names: strip path separators so Path().stem can't truncate
-    safe_names = [n.replace("/", "_").replace("\\", "_") for n in names]
+    safe_names = [n.replace("/", "_").replace("\\", "_").replace(".", "_") for n in names]
     names_str = "-".join(safe_names)
     filename = pattern.format(
         date=now.strftime("%Y-%m-%d"),
@@ -268,7 +268,7 @@ def _expand_filename(pattern: str, names: list[str]) -> str:
     base = filename.rsplit(".", 1)
     stem = base[0]
     suffix = f".{base[1]}" if len(base) > 1 else ""
-    stem = re.sub(r"-{2,}", "-", stem)  # collapse multiple dashes
+    stem = re.sub(r"-{2,}", "-", stem)
     stem = stem.strip("-")  # strip leading/trailing dashes
     return stem + suffix
 
