@@ -15,6 +15,7 @@ wheels/
 # Transcripts (example outputs)
 *.md
 !README.md
+!PRIVACY_AUDIT.md
 
 # Swift build artifacts (users run `make build`)
 audiocapture/.build/

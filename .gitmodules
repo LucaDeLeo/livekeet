@@ -1,0 +1,3 @@
+[submodule "ghost-pepper"]
+	path = ghost-pepper
+	url = https://github.com/matthartman/ghost-pepper.git

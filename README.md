@@ -223,6 +223,40 @@ Speaker "Remote 2" (8 lines):
 
 Press `n` to rename, `m` to see more quotes, or `s` to skip. Press Ctrl+C to cancel relabeling.
 
+## Cleanup (optional)
+
+Livekeet can pipe each transcribed turn through Claude Haiku to strip fillers ("um", "uh"), fix obvious self-corrections, and apply user-defined replacements. It's **off by default**. When off, raw text is written unchanged and nothing leaves your machine.
+
+```bash
+uv tool install 'git+https://github.com/LucaDeLeo/livekeet.git#egg=livekeet[cleanup]'
+livekeet --cleanup
+```
+
+**Requirements:** Cleanup reuses your local [Claude Code](https://claude.com/claude-code) authentication via the `claude-runner` package — no API key to manage. Claude Code must be installed and signed in on the same machine. If the call fails (Claude Code missing, auth expired, network error), livekeet falls back to raw text and disables cleanup for the rest of the session.
+
+**Trade-off:** When `--cleanup` is on, transcribed text is sent to Anthropic's API. Audio never leaves your machine — only the text. Keep cleanup off if that's a concern.
+
+**Deterministic replacements** (run even without `--cleanup`): add phrase fixes to your config:
+
+```toml
+[cleanup]
+enabled = false          # or pass --cleanup
+model = "claude-haiku-4-5"
+timeout_s = 6.0
+
+[cleanup.corrections]    # applied always, case-insensitive, word-boundary
+"chat gbt" = "ChatGPT"
+```
+
+Flags:
+- `--cleanup` — enable LLM cleanup for this session
+- `--no-cleanup` — disable cleanup even if the config turns it on
+- `--dump-audio` — save each speech segment as a WAV in a `{transcript}.audio/` directory alongside the markdown (useful for building a local eval corpus)
+
+## Privacy
+
+Livekeet runs 100% locally by default: audio capture, VAD, transcription, and diarization all execute on-device. The only network-enabled feature is optional Claude Haiku cleanup (`--cleanup`), which transmits transcribed text — never audio — to the Anthropic API when enabled. See [`PRIVACY_AUDIT.md`](PRIVACY_AUDIT.md) for a full audit, including a prompt you can paste into Claude Code to re-verify the claims against the current code.
+
 ## Models
 
 | Model | Size | Speed | Notes |

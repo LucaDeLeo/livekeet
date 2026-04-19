@@ -33,6 +33,9 @@ import numpy as np
 import sounddevice as sd
 import webrtcvad
 
+from livekeet_cleanup import CleanupState, strip_artifacts
+from livekeet_models import AVAILABLE_MODELS, DEFAULT_MODEL_ID, MULTILINGUAL_MODEL_ID
+
 # Audio settings
 SAMPLE_RATE = 16000
 VAD_FRAME_MS = 30
@@ -43,6 +46,15 @@ STATUS_INTERVAL = 10  # seconds between status updates
 NO_AUDIO_WARNING_SECONDS = 10
 SUBPROCESS_MAX_RESTARTS = 5
 SUBPROCESS_RESTART_DELAY = 2.0
+
+
+def _write_wav_mono16(path, audio: np.ndarray) -> None:
+    """Write `audio` (float32 in [-1, 1]) as a mono 16-bit PCM WAV at SAMPLE_RATE."""
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(SAMPLE_RATE)
+        wav.writeframes((audio * 32767).astype(np.int16).tobytes())
 
 # Paths
 DATA_DIR = Path.home() / ".local" / "share" / "livekeet"
@@ -202,6 +214,15 @@ model = "mlx-community/parakeet-tdt-0.6b-v2"
 
 # [pyannote]
 # token = "hf_..."  # HuggingFace token (or set HF_TOKEN env var)
+
+# [cleanup]
+# enabled = false                    # pass --cleanup or set this to true
+# model = "claude-haiku-4-5"
+# timeout_s = 6.0
+# system_prompt = ""                 # empty = use built-in default
+#
+# [cleanup.corrections]              # deterministic replacements, applied always
+# "chat gbt" = "ChatGPT"
 """
 
 
@@ -210,7 +231,14 @@ def load_config() -> dict:
     config = {
         "output": {"directory": "", "filename": "{datetime}.md"},
         "speaker": {"name": "Me"},
-        "defaults": {"model": "mlx-community/parakeet-tdt-0.6b-v2", "diarize": False, "engine": "wespeaker"},
+        "defaults": {"model": DEFAULT_MODEL_ID, "diarize": False, "engine": "wespeaker"},
+        "cleanup": {
+            "enabled": False,
+            "model": "claude-haiku-4-5",
+            "timeout_s": 6.0,
+            "system_prompt": "",
+            "corrections": {},
+        },
     }
 
     if CONFIG_FILE.exists():
@@ -574,6 +602,8 @@ class Transcriber:
         status_enabled: bool = False,
         diarize: bool = False,
         engine: str = "wespeaker",
+        cleanup=None,
+        dump_audio_dir: Path | None = None,
     ):
         self.output_file = output_file
         self.device = device
@@ -584,6 +614,10 @@ class Transcriber:
         self.status_enabled = status_enabled
         self.diarize = diarize
         self.engine = engine
+        self.cleanup = cleanup
+        self.dump_audio_dir = dump_audio_dir
+        self._dump_counter = 0
+        self._dump_counter_lock = Lock()
         self.mic_queue: Queue = Queue()
         self.sys_queue: Queue = Queue()
         self.running = False
@@ -838,12 +872,7 @@ class Transcriber:
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             temp_path = f.name
-            with wave.open(f, "wb") as wav:
-                wav.setnchannels(1)
-                wav.setsampwidth(2)
-                wav.setframerate(SAMPLE_RATE)
-                audio_int16 = (audio * 32767).astype(np.int16)
-                wav.writeframes(audio_int16.tobytes())
+        _write_wav_mono16(temp_path, audio)
 
         try:
             with self._model_lock:
@@ -858,6 +887,24 @@ class Transcriber:
         """Return the default speaker label for a channel."""
         return self.speaker_name if channel == "mic" else self.other_name
 
+    def _dump_segment(self, audio: np.ndarray, channel: str) -> None:
+        """Write a debug WAV of a detected speech segment to self.dump_audio_dir.
+
+        Naming matches livekeet-mlx: {seq:03d}_{channel}_{HHMMSS}_{dur:.1f}s.wav.
+        """
+        if self.dump_audio_dir is None:
+            return
+        with self._dump_counter_lock:
+            self._dump_counter += 1
+            seq = self._dump_counter
+        duration = len(audio) / SAMPLE_RATE
+        filename = f"{seq:03d}_{channel}_{datetime.now().strftime('%H%M%S')}_{duration:.1f}s.wav"
+        path = self.dump_audio_dir / filename
+        try:
+            _write_wav_mono16(path, audio)
+        except Exception as e:
+            print(f"Failed to dump audio segment: {e}", file=sys.stderr)
+
     def _flush_speech_segment(self, speech_frames: list[np.ndarray], channel: str) -> None:
         """Transcribe and write one completed speech segment."""
         if not speech_frames:
@@ -869,6 +916,7 @@ class Transcriber:
             return
 
         speech_audio = np.concatenate(speech_frames)
+        self._dump_segment(speech_audio, channel)
 
         # Estimate when speech started in the recording timeline
         # (must be computed before transcription delay shifts monotonic clock)
@@ -914,7 +962,11 @@ class Transcriber:
                 sent_offset = speech_offset + sentence.start
                 sent_time = base_time + timedelta(seconds=sentence.start)
                 timestamp = sent_time.strftime("%H:%M:%S")
-                entries.append((sent_offset, sentence.text.strip(), timestamp))
+                text = self._process_turn(sentence.text.strip(), channel)
+                if text:
+                    entries.append((sent_offset, text, timestamp))
+            if not entries:
+                return
             with self._write_lock:
                 for sent_offset, text, timestamp in entries:
                     self._segments.append((sent_offset, text, channel, timestamp))
@@ -925,9 +977,14 @@ class Transcriber:
 
         # Non-pyannote path: one line per sentence with real sentence text
         for sentence in sentences:
-            text = sentence.text.strip()
+            text = self._process_turn(sentence.text.strip(), channel)
             if text:
                 self._write_transcript(text, speaker=speaker)
+
+    def _process_turn(self, text: str, channel: str) -> str:
+        if self.cleanup is None:
+            return strip_artifacts(text)
+        return self.cleanup.process_turn(text, channel)
 
     def channel_worker(self, queue: Queue, channel: str, vad: webrtcvad.Vad):
         """Background thread that runs VAD + transcription for one audio channel."""
@@ -1008,7 +1065,8 @@ class Transcriber:
     def _rebuild_transcript(self) -> None:
         """Rewrite the entire .md file from _segments + _pyannote_turns.
 
-        Must be called under _write_lock.
+        Must be called under _write_lock. Writes atomically via temp file + os.replace
+        so a crash mid-write cannot truncate the transcript.
         """
         lines = [f"# Transcription - {self._session_start_str}", ""]
 
@@ -1016,7 +1074,9 @@ class Transcriber:
             speaker = self._resolve_speaker(offset, channel)
             lines.append(f"[{timestamp}] **{speaker}**: {text}")
 
-        self.output_file.write_text("\n".join(lines) + "\n")
+        tmp = self.output_file.with_suffix(self.output_file.suffix + ".tmp")
+        tmp.write_text("\n".join(lines) + "\n")
+        os.replace(tmp, self.output_file)
 
     def _diarizer_worker(self) -> None:
         """Background thread: run pyannote periodically on all audio captured so far."""
@@ -1351,10 +1411,7 @@ Examples:
     )
     parser.add_argument(
         "--model",
-        choices=[
-            "mlx-community/parakeet-tdt-0.6b-v2",
-            "mlx-community/parakeet-tdt-0.6b-v3",
-        ],
+        choices=[m.id for m in AVAILABLE_MODELS],
         help="Model to use (default: from config)",
     )
     parser.add_argument(
@@ -1382,6 +1439,21 @@ Examples:
         "--status",
         action="store_true",
         help="Show periodic status updates while recording",
+    )
+    parser.add_argument(
+        "--cleanup",
+        action="store_true",
+        help="Run each transcribed turn through Claude Haiku for cleanup (requires Claude Code)",
+    )
+    parser.add_argument(
+        "--no-cleanup",
+        action="store_true",
+        help="Disable cleanup even if enabled in config",
+    )
+    parser.add_argument(
+        "--dump-audio",
+        action="store_true",
+        help="Save each speech segment as a WAV alongside the transcript (for debugging / eval)",
     )
 
     args = parser.parse_args()
@@ -1455,9 +1527,32 @@ Examples:
 
     # Get model
     if args.multilingual:
-        model = "mlx-community/parakeet-tdt-0.6b-v3"
+        model = MULTILINGUAL_MODEL_ID
     else:
         model = args.model or config["defaults"]["model"]
+
+    # Resolve cleanup: --no-cleanup > --cleanup > config
+    cleanup_cfg = config.get("cleanup", {}) or {}
+    if args.no_cleanup:
+        cleanup_enabled = False
+    elif args.cleanup:
+        cleanup_enabled = True
+    else:
+        cleanup_enabled = bool(cleanup_cfg.get("enabled", False))
+
+    cleanup_state = CleanupState(
+        enabled=cleanup_enabled,
+        corrections=cleanup_cfg.get("corrections") or {},
+        system_prompt=cleanup_cfg.get("system_prompt") or "",
+        model=cleanup_cfg.get("model") or "claude-haiku-4-5",
+        timeout_s=float(cleanup_cfg.get("timeout_s", 6.0)),
+    )
+
+    dump_audio_dir: Path | None = None
+    if args.dump_audio:
+        dump_audio_dir = output_path.with_suffix(".audio")
+        dump_audio_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Audio dump: {dump_audio_dir}")
 
     # Start transcription
     transcriber = Transcriber(
@@ -1471,6 +1566,8 @@ Examples:
         status_enabled=args.status,
         diarize=diarize,
         engine=engine,
+        cleanup=cleanup_state,
+        dump_audio_dir=dump_audio_dir,
     )
     transcriber.start(config=config)
 

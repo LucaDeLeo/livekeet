@@ -149,25 +149,34 @@ def test_diarization_module_importable():
     assert callable(SpeakerTracker)
 
 
-def test_pcm_to_temp_wav(tmp_path):
-    """_pcm_to_temp_wav produces a valid mono 16kHz WAV."""
+def test_appendable_wav(tmp_path):
+    """AppendableWav produces a valid mono 16kHz WAV with incremental appends."""
     import wave
     import numpy as np
 
-    # Generate 1 second of silence as int16 PCM
-    samples = np.zeros(16000, dtype=np.int16)
-    pcm_data = samples.tobytes()
+    wav_path = tmp_path / "test.wav"
+    aw = livekeet.AppendableWav(wav_path)
 
-    wav_path = livekeet.Transcriber._pcm_to_temp_wav(pcm_data)
-    try:
-        assert wav_path.exists()
-        with wave.open(str(wav_path), "rb") as wf:
-            assert wf.getnchannels() == 1
-            assert wf.getsampwidth() == 2
-            assert wf.getframerate() == 16000
-            assert wf.getnframes() == 16000
-    finally:
-        wav_path.unlink(missing_ok=True)
+    # Append 1 second of silence as int16 PCM
+    samples = np.zeros(16000, dtype=np.int16)
+    aw.append(samples.tobytes())
+
+    assert aw.audio_seconds == 1.0
+    assert wav_path.exists()
+    with wave.open(str(wav_path), "rb") as wf:
+        assert wf.getnchannels() == 1
+        assert wf.getsampwidth() == 2
+        assert wf.getframerate() == 16000
+        assert wf.getnframes() == 16000
+
+    # Append another second — should grow
+    aw.append(samples.tobytes())
+    assert aw.audio_seconds == 2.0
+    with wave.open(str(wav_path), "rb") as wf:
+        assert wf.getnframes() == 32000
+
+    aw.cleanup()
+    assert not wav_path.exists()
 
 
 def _make_transcriber_stub(output_file):
